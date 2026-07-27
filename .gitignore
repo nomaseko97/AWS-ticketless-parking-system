@@ -1,0 +1,2 @@
+# Ignore dependency folders in any subdirectory
+**/node_modules/
