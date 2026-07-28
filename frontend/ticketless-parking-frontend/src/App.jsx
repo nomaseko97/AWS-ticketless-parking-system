@@ -2,12 +2,16 @@ import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
 const MAX_FILE_SIZE = 5 * 1024 * 1024;
+const UPLOAD_URL_ENDPOINT = import.meta.env.VITE_UPLOAD_URL_ENDPOINT;
 
 function App() {
   const [operation, setOperation] = useState("entry");
   const [selectedImage, setSelectedImage] = useState(null);
   const [previewUrl, setPreviewUrl] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
+  const [successMessage, setSuccessMessage] = useState("");
+  const [isUploading, setIsUploading] = useState(false);
+
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -26,6 +30,7 @@ function App() {
     setSelectedImage(null);
     setPreviewUrl("");
     setErrorMessage("");
+    setSuccessMessage("");
 
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
@@ -39,6 +44,7 @@ function App() {
 
   function validateAndSelectImage(file) {
     setErrorMessage("");
+    setSuccessMessage("");
 
     if (!file) {
       return;
@@ -73,7 +79,10 @@ function App() {
     validateAndSelectImage(event.dataTransfer.files[0]);
   }
 
-  function handleUpload() {
+  async function handleUpload() {
+    setErrorMessage("");
+    setSuccessMessage("");
+
     if (!selectedImage) {
       setErrorMessage(
         `Please choose a vehicle ${operation} image before uploading.`,
@@ -81,17 +90,91 @@ function App() {
       return;
     }
 
-    const destination = `uploads/${operation}/`;
+    if (!UPLOAD_URL_ENDPOINT) {
+      setErrorMessage(
+        "The upload API endpoint is not configured. Check the frontend .env file.",
+      );
+      return;
+    }
 
-    console.log({
-      operation,
-      destination,
-      file: selectedImage,
-    });
+    setIsUploading(true);
 
-    alert(
-      `Vehicle ${operation} image is ready for upload. AWS integration will be added next.`,
-    );
+    try {
+      /*
+       * Step 1:
+       * Request a temporary S3 upload URL from API Gateway and Lambda.
+       */
+      const urlResponse = await fetch(UPLOAD_URL_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          operation,
+          contentType: selectedImage.type,
+        }),
+      });
+
+      const responseText = await urlResponse.text();
+
+      let urlData;
+
+      try {
+        urlData = responseText ? JSON.parse(responseText) : {};
+      } catch {
+        throw new Error("The upload API returned an invalid response.");
+      }
+
+      if (!urlResponse.ok) {
+        throw new Error(
+          urlData.message ||
+            `Could not create an upload URL. Status: ${urlResponse.status}`,
+        );
+      }
+
+      if (!urlData.uploadUrl || !urlData.objectKey) {
+        throw new Error(
+          "The upload API did not return the required upload information.",
+        );
+      }
+
+      /*
+       * Step 2:
+       * Upload the selected image directly to the private S3 bucket.
+       */
+      const uploadResponse = await fetch(urlData.uploadUrl, {
+        method: "PUT",
+        headers: {
+          "Content-Type": selectedImage.type,
+        },
+        body: selectedImage,
+      });
+
+      if (!uploadResponse.ok) {
+        throw new Error(
+          `The image could not be uploaded to S3. Status: ${uploadResponse.status}`,
+        );
+      }
+
+      console.log("Image uploaded successfully:", {
+        operation,
+        objectKey: urlData.objectKey,
+      });
+
+      setSuccessMessage(
+        `Vehicle ${operation} image uploaded successfully.`,
+      );
+    } catch (error) {
+      console.error("Image upload failed:", error);
+
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "The image could not be uploaded.",
+      );
+    } finally {
+      setIsUploading(false);
+    }
   }
 
   const isEntry = operation === "entry";
@@ -106,7 +189,9 @@ function App() {
 
           <div>
             <p className="brand-name">ParkFlow</p>
-            <p className="brand-description">Ticketless Parking Management</p>
+            <p className="brand-description">
+              Ticketless Parking Management
+            </p>
           </div>
         </div>
 
@@ -146,9 +231,14 @@ function App() {
               }`}
               onClick={() => handleOperationChange("entry")}
               aria-pressed={isEntry}
+              disabled={isUploading}
             >
               <span className="operation-icon operation-icon--entry">
-                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <svg
+                  viewBox="0 0 24 24"
+                  aria-hidden="true"
+                  focusable="false"
+                >
                   <path d="M10 17l5-5-5-5v10z" />
                   <path d="M19 19H5V5h14v4h-2V7H7v10h10v-2h2v4z" />
                 </svg>
@@ -156,10 +246,14 @@ function App() {
 
               <span className="operation-content">
                 <strong>Vehicle Entry</strong>
-                <span>Register a vehicle entering the parking facility.</span>
+                <span>
+                  Register a vehicle entering the parking facility.
+                </span>
               </span>
 
-              <span className="selection-indicator">{isEntry ? "✓" : ""}</span>
+              <span className="selection-indicator">
+                {isEntry ? "✓" : ""}
+              </span>
             </button>
 
             <button
@@ -169,9 +263,14 @@ function App() {
               }`}
               onClick={() => handleOperationChange("exit")}
               aria-pressed={!isEntry}
+              disabled={isUploading}
             >
               <span className="operation-icon operation-icon--exit">
-                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <svg
+                  viewBox="0 0 24 24"
+                  aria-hidden="true"
+                  focusable="false"
+                >
                   <path d="M14 7l-5 5 5 5V7z" />
                   <path d="M5 5h14v14H5v-4h2v2h10V7H7v2H5V5z" />
                 </svg>
@@ -182,7 +281,9 @@ function App() {
                 <span>Complete an active parking session.</span>
               </span>
 
-              <span className="selection-indicator">{!isEntry ? "✓" : ""}</span>
+              <span className="selection-indicator">
+                {!isEntry ? "✓" : ""}
+              </span>
             </button>
           </div>
 
@@ -191,7 +292,10 @@ function App() {
           <div className="section-heading">
             <div>
               <span className="step-number">2</span>
-              <h2>Upload vehicle {isEntry ? "entry" : "exit"} image</h2>
+
+              <h2>
+                Upload vehicle {isEntry ? "entry" : "exit"} image
+              </h2>
             </div>
 
             <p>Use a clear image where the licence plate is visible.</p>
@@ -212,15 +316,19 @@ function App() {
 
               <h3>Upload licence plate image</h3>
 
-              <p>Drag and drop an image here, or browse your computer.</p>
+              <p>
+                Drag and drop an image here, or browse your computer.
+              </p>
 
               <label className="browse-button">
                 Choose image
+
                 <input
                   ref={fileInputRef}
                   type="file"
                   accept="image/jpeg,image/png,image/webp"
                   onChange={handleImageChange}
+                  disabled={isUploading}
                 />
               </label>
 
@@ -238,7 +346,9 @@ function App() {
 
                 <span
                   className={`operation-badge ${
-                    isEntry ? "operation-badge--entry" : "operation-badge--exit"
+                    isEntry
+                      ? "operation-badge--entry"
+                      : "operation-badge--exit"
                   }`}
                 >
                   {isEntry ? "Entry image" : "Exit image"}
@@ -248,6 +358,7 @@ function App() {
               <div className="file-details">
                 <div>
                   <p className="file-name">{selectedImage.name}</p>
+
                   <p className="file-size">
                     {(selectedImage.size / 1024 / 1024).toFixed(2)} MB
                   </p>
@@ -257,6 +368,7 @@ function App() {
                   type="button"
                   className="remove-button"
                   onClick={resetImage}
+                  disabled={isUploading}
                 >
                   Remove
                 </button>
@@ -270,6 +382,12 @@ function App() {
             </div>
           )}
 
+          {successMessage && (
+            <div className="success-message" role="status">
+              {successMessage}
+            </div>
+          )}
+
           <div className="action-area">
             <div className="security-note">
               <span aria-hidden="true">🔒</span>
@@ -280,10 +398,13 @@ function App() {
               type="button"
               className="upload-button"
               onClick={handleUpload}
-              disabled={!selectedImage}
+              disabled={!selectedImage || isUploading}
             >
-              Upload {isEntry ? "Entry" : "Exit"} Image
-              <span aria-hidden="true">→</span>
+              {isUploading
+                ? "Uploading..."
+                : `Upload ${isEntry ? "Entry" : "Exit"} Image`}
+
+              {!isUploading && <span aria-hidden="true">→</span>}
             </button>
           </div>
         </section>

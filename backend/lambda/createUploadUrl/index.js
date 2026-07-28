@@ -24,16 +24,31 @@ function createResponse(statusCode, body) {
 
 export async function handler(event) {
   try {
-    if (!process.env.BUCKET_NAME) {
-      throw new Error("BUCKET_NAME environment variable is not configured.");
+    const bucketName = process.env.BUCKET_NAME?.trim();
+
+    if (!bucketName) {
+      throw new Error(
+        "BUCKET_NAME environment variable is not configured.",
+      );
     }
 
-    const requestBody =
-      typeof event.body === "string" ? JSON.parse(event.body) : event.body;
+    let requestBody = {};
 
-    const { operation, contentType } = requestBody || {};
+    if (typeof event.body === "string") {
+      try {
+        requestBody = JSON.parse(event.body);
+      } catch {
+        return createResponse(400, {
+          message: "The request body must contain valid JSON.",
+        });
+      }
+    } else if (event.body) {
+      requestBody = event.body;
+    }
 
-    if (!["entry", "exit"].includes(operation)) {
+    const { operation, contentType } = requestBody;
+
+    if (operation !== "entry" && operation !== "exit") {
       return createResponse(400, {
         message: "Operation must be entry or exit.",
       });
@@ -47,17 +62,10 @@ export async function handler(event) {
       });
     }
 
-    const currentDate = new Date();
-    const year = currentDate.getUTCFullYear();
-    const month = String(currentDate.getUTCMonth() + 1).padStart(2, "0");
-    const day = String(currentDate.getUTCDate()).padStart(2, "0");
-
-    const objectKey =
-      `uploads/${operation}/${year}/${month}/${day}/` +
-      `${randomUUID()}.${fileExtension}`;
+    const objectKey = `uploads/${operation}/${randomUUID()}.${fileExtension}`;
 
     const uploadCommand = new PutObjectCommand({
-      Bucket: process.env.BUCKET_NAME,
+      Bucket: bucketName,
       Key: objectKey,
       ContentType: contentType,
     });

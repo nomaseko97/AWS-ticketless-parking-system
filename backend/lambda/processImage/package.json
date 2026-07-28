@@ -1,0 +1,9 @@
+{
+  "name": "ticketless-parking-process-image",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@aws-sdk/client-rekognition": "^3.1096.0"
+  }
+}
