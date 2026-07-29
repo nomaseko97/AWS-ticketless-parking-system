@@ -3,8 +3,23 @@ import {
   RekognitionClient,
 } from "@aws-sdk/client-rekognition";
 
+import { InvokeCommand, LambdaClient } from "@aws-sdk/client-lambda";
+
+const REGION = process.env.AWS_REGION || "eu-west-1";
+
+const DATABASE_HANDLER_FUNCTION_NAME =
+  process.env.DATABASE_HANDLER_FUNCTION_NAME;
+
+if (!DATABASE_HANDLER_FUNCTION_NAME) {
+  throw new Error("DATABASE_HANDLER_FUNCTION_NAME is not configured.");
+}
+
 const rekognitionClient = new RekognitionClient({
-  region: process.env.AWS_REGION || "eu-west-1",
+  region: REGION,
+});
+
+const lambdaClient = new LambdaClient({
+  region: REGION,
 });
 
 function decodeS3Key(encodedKey) {
@@ -90,59 +105,173 @@ function horizontalGap(firstDetection, secondDetection) {
   return Math.max(0, rightBox.left - leftBox.right);
 }
 
+function horizontalOverlapRatio(firstDetection, secondDetection) {
+  const firstBox = getBox(firstDetection);
+  const secondBox = getBox(secondDetection);
+
+  if (!firstBox || !secondBox) {
+    return 0;
+  }
+
+  const overlapLeft = Math.max(firstBox.left, secondBox.left);
+
+  const overlapRight = Math.min(firstBox.right, secondBox.right);
+
+  const overlapWidth = Math.max(0, overlapRight - overlapLeft);
+
+  const smallerWidth = Math.min(firstBox.width, secondBox.width);
+
+  if (smallerWidth <= 0) {
+    return 0;
+  }
+
+  return overlapWidth / smallerWidth;
+}
+
 function sortLeftToRight(detections) {
-  return [...detections].sort((first, second) => {
-    const firstLeft = getBox(first)?.left ?? 0;
-    const secondLeft = getBox(second)?.left ?? 0;
+  return [...detections].sort((firstDetection, secondDetection) => {
+    const firstLeft = getBox(firstDetection)?.left ?? 0;
+
+    const secondLeft = getBox(secondDetection)?.left ?? 0;
 
     return firstLeft - secondLeft;
   });
 }
 
-function mergeWithOverlap(leftText, rightText) {
-  const left = normalisePlateText(leftText);
-  const right = normalisePlateText(rightText);
+function calculateAverageCharacterWidth(detection) {
+  const box = getBox(detection);
 
-  if (!left) {
-    return right;
+  const text = normalisePlateText(detection?.DetectedText);
+
+  if (!box || text.length === 0) {
+    return 0;
   }
 
-  if (!right) {
-    return left;
+  return box.width / text.length;
+}
+
+function shouldRemoveTextOverlap(
+  previousDetection,
+  currentDetection,
+  overlapLength,
+) {
+  /*
+   * If the Rekognition boxes overlap physically, the
+   * repeated boundary character probably represents the
+   * same character detected twice.
+   *
+   * Example:
+   * 9JR + RI205 becomes 9JRI205.
+   */
+  const physicalOverlap = horizontalOverlapRatio(
+    previousDetection,
+    currentDetection,
+  );
+
+  if (physicalOverlap >= 0.02) {
+    return true;
   }
 
-  if (left.includes(right)) {
-    return left;
+  /*
+   * If the boxes do not overlap, only remove the repeated
+   * character when the two text boxes are extremely close.
+   *
+   * This preserves both G characters in:
+   * JC12CG + GP = JC12CGGP
+   *
+   * The Gauteng emblem creates a larger physical gap between
+   * the first G and the second G.
+   */
+  const gap = horizontalGap(previousDetection, currentDetection);
+
+  const previousCharacterWidth =
+    calculateAverageCharacterWidth(previousDetection);
+
+  const currentCharacterWidth =
+    calculateAverageCharacterWidth(currentDetection);
+
+  const availableCharacterWidths = [
+    previousCharacterWidth,
+    currentCharacterWidth,
+  ].filter((width) => width > 0);
+
+  if (availableCharacterWidths.length === 0) {
+    return false;
   }
 
-  if (right.includes(left)) {
-    return right;
+  const smallerCharacterWidth = Math.min(...availableCharacterWidths);
+
+  const allowedGap = Math.max(
+    0.003,
+    smallerCharacterWidth * 0.4 * overlapLength,
+  );
+
+  return gap <= allowedGap;
+}
+
+function mergeDetectedSegments(
+  currentText,
+  previousDetection,
+  currentDetection,
+) {
+  const leftText = normalisePlateText(currentText);
+
+  const rightText = normalisePlateText(currentDetection?.DetectedText);
+
+  if (!leftText) {
+    return rightText;
   }
 
-  const maximumOverlap = Math.min(left.length, right.length);
+  if (!rightText) {
+    return leftText;
+  }
+
+  const maximumOverlap = Math.min(leftText.length, rightText.length);
 
   for (
     let overlapLength = maximumOverlap;
     overlapLength > 0;
     overlapLength -= 1
   ) {
-    const leftEnding = left.slice(-overlapLength);
-    const rightBeginning = right.slice(0, overlapLength);
+    const leftEnding = leftText.slice(-overlapLength);
 
-    if (leftEnding === rightBeginning) {
-      return left + right.slice(overlapLength);
+    const rightBeginning = rightText.slice(0, overlapLength);
+
+    if (leftEnding !== rightBeginning) {
+      continue;
+    }
+
+    if (
+      shouldRemoveTextOverlap(
+        previousDetection,
+        currentDetection,
+        overlapLength,
+      )
+    ) {
+      return leftText + rightText.slice(overlapLength);
     }
   }
 
-  return left + right;
+  return leftText + rightText;
 }
 
 function createCandidate(detections, merged) {
   const sortedDetections = sortLeftToRight(detections);
 
-  const normalisedText = sortedDetections.reduce((currentText, detection) => {
-    return mergeWithOverlap(currentText, detection.DetectedText);
-  }, "");
+  const normalisedText = sortedDetections.reduce(
+    (currentText, detection, index) => {
+      if (index === 0) {
+        return normalisePlateText(detection.DetectedText);
+      }
+
+      return mergeDetectedSegments(
+        currentText,
+        sortedDetections[index - 1],
+        detection,
+      );
+    },
+    "",
+  );
 
   const containsLetter = /[A-Z]/.test(normalisedText);
 
@@ -152,7 +281,7 @@ function createCandidate(detections, merged) {
     return null;
   }
 
-  if (normalisedText.length < 4 || normalisedText.length > 10) {
+  if (normalisedText.length < 4 || normalisedText.length > 12) {
     return null;
   }
 
@@ -168,7 +297,7 @@ function createCandidate(detections, merged) {
     score += 45;
   }
 
-  if (normalisedText.length >= 5 && normalisedText.length <= 8) {
+  if (normalisedText.length >= 5 && normalisedText.length <= 9) {
     score += 45;
   } else {
     score += 20;
@@ -190,6 +319,7 @@ function createCandidate(detections, merged) {
     const bottom = Math.max(...boxes.map((box) => box.bottom));
 
     const combinedWidth = right - left;
+
     const combinedHeight = bottom - top;
 
     score += Math.min(combinedWidth * 70, 40);
@@ -201,10 +331,15 @@ function createCandidate(detections, merged) {
     originalText: sortedDetections
       .map((detection) => detection.DetectedText)
       .join(" + "),
+
     normalisedText,
+
     confidence: Number(confidence.toFixed(2)),
+
     score: Number(score.toFixed(2)),
+
     merged,
+
     detectionCount: sortedDetections.length,
   };
 }
@@ -221,7 +356,10 @@ function selectPlateCandidate(textDetections = []) {
 
   const candidates = [];
 
-  // Add every complete detected line as a candidate.
+  /*
+   * First, create candidates from each individual
+   * Rekognition LINE detection.
+   */
   for (const detection of lineDetections) {
     const candidate = createCandidate([detection], false);
 
@@ -231,8 +369,8 @@ function selectPlateCandidate(textDetections = []) {
   }
 
   /*
-   * Combine two text sections when Rekognition split
-   * one licence plate into separate lines.
+   * Next, combine LINE detections that appear next to
+   * each other on the same row.
    */
   for (
     let firstIndex = 0;
@@ -267,6 +405,10 @@ function selectPlateCandidate(textDetections = []) {
     }
   }
 
+  /*
+   * Remove duplicate candidate values, keeping the
+   * highest-scoring version.
+   */
   const uniqueCandidates = new Map();
 
   for (const candidate of candidates) {
@@ -278,7 +420,8 @@ function selectPlateCandidate(textDetections = []) {
   }
 
   const sortedCandidates = [...uniqueCandidates.values()].sort(
-    (first, second) => second.score - first.score,
+    (firstCandidate, secondCandidate) =>
+      secondCandidate.score - firstCandidate.score,
   );
 
   console.log(
@@ -287,6 +430,109 @@ function selectPlateCandidate(textDetections = []) {
   );
 
   return sortedCandidates[0] ?? null;
+}
+
+function decodeLambdaPayload(payload) {
+  if (!payload) {
+    throw new Error("The database Lambda returned no payload.");
+  }
+
+  const decodedPayload = Buffer.from(payload).toString("utf-8");
+
+  try {
+    return JSON.parse(decodedPayload);
+  } catch {
+    throw new Error(
+      `The database Lambda returned invalid JSON: ${decodedPayload}`,
+    );
+  }
+}
+
+function decodeResponseBody(body) {
+  if (!body) {
+    return {};
+  }
+
+  if (typeof body === "object") {
+    return body;
+  }
+
+  try {
+    return JSON.parse(body);
+  } catch {
+    return {
+      message: body,
+    };
+  }
+}
+
+async function invokeDatabaseHandler({
+  operation,
+  plateNumber,
+  imageKey,
+  confidence,
+}) {
+  const databaseRequest = {
+    action: operation,
+    plateNumber,
+    imageKey,
+    confidence,
+  };
+
+  console.log("Sending request to database Lambda:", databaseRequest);
+
+  const command = new InvokeCommand({
+    FunctionName: DATABASE_HANDLER_FUNCTION_NAME,
+
+    InvocationType: "RequestResponse",
+
+    Payload: Buffer.from(JSON.stringify(databaseRequest)),
+  });
+
+  const invokeResponse = await lambdaClient.send(command);
+
+  if (invokeResponse.FunctionError) {
+    const errorPayload = invokeResponse.Payload
+      ? Buffer.from(invokeResponse.Payload).toString("utf-8")
+      : "No error details returned.";
+
+    throw new Error(`Database Lambda invocation failed: ${errorPayload}`);
+  }
+
+  const lambdaResponse = decodeLambdaPayload(invokeResponse.Payload);
+
+  const statusCode = Number(lambdaResponse.statusCode ?? 500);
+
+  const responseBody = decodeResponseBody(lambdaResponse.body);
+
+  const result = {
+    statusCode,
+    ...responseBody,
+  };
+
+  if (statusCode >= 500) {
+    throw new Error(
+      responseBody.error ||
+        responseBody.message ||
+        "The database operation failed.",
+    );
+  }
+
+  if (statusCode >= 400) {
+    console.warn("Database request was rejected:", result);
+
+    return {
+      saved: false,
+      ...result,
+    };
+  }
+
+  console.log("Database operation successful:", result);
+
+  return {
+    saved: true,
+    ...result,
+  };
 }
 
 async function processS3Record(record) {
@@ -334,10 +580,32 @@ async function processS3Record(record) {
     .filter((detection) => detection.Type === "LINE")
     .map((detection) => ({
       text: detection.DetectedText ?? "",
+
       confidence: Number((detection.Confidence ?? 0).toFixed(2)),
     }));
 
   const plateCandidate = selectPlateCandidate(textDetections);
+
+  let databaseResult = {
+    saved: false,
+    reason: "No licence plate candidate was found.",
+  };
+
+  if (plateCandidate) {
+    databaseResult = await invokeDatabaseHandler({
+      operation,
+
+      plateNumber: plateCandidate.normalisedText,
+
+      imageKey: objectKey,
+
+      confidence: plateCandidate.confidence,
+    });
+  } else {
+    console.warn(
+      "No licence plate candidate was found. The image was not saved as a parking session.",
+    );
+  }
 
   const result = {
     bucketName,
@@ -345,12 +613,10 @@ async function processS3Record(record) {
     operation,
     detectedLines,
     plateCandidate,
+    databaseResult,
   };
 
-  console.log(
-    "Rekognition processing result:",
-    JSON.stringify(result, null, 2),
-  );
+  console.log("Complete processing result:", JSON.stringify(result, null, 2));
 
   return result;
 }
@@ -360,6 +626,8 @@ export const handler = async (event) => {
     if (!Array.isArray(event?.Records) || event.Records.length === 0) {
       throw new Error("No S3 records were found in the event.");
     }
+
+    console.log("Received S3 event:", JSON.stringify(event));
 
     const results = [];
 
@@ -371,8 +639,10 @@ export const handler = async (event) => {
 
     return {
       statusCode: 200,
+
       body: JSON.stringify({
         message: "Image processing completed.",
+
         results,
       }),
     };

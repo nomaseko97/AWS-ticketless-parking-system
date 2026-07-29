@@ -1,18 +1,74 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
 
+const apiBaseUrl = import.meta.env.VITE_API_BASE_URL;
+
+const uploadUrlEndpoint = `${apiBaseUrl}/upload-url`;
+const sessionsEndpoint = `${apiBaseUrl}/sessions`;
+
 const MAX_FILE_SIZE = 5 * 1024 * 1024;
-const UPLOAD_URL_ENDPOINT = import.meta.env.VITE_UPLOAD_URL_ENDPOINT;
+const SESSION_REFRESH_INTERVAL = 10000;
 
 function App() {
   const [operation, setOperation] = useState("entry");
   const [selectedImage, setSelectedImage] = useState(null);
   const [previewUrl, setPreviewUrl] = useState("");
+
   const [errorMessage, setErrorMessage] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
   const [isUploading, setIsUploading] = useState(false);
 
+  const [sessions, setSessions] = useState([]);
+  const [isLoadingSessions, setIsLoadingSessions] = useState(true);
+  const [lastUpdated, setLastUpdated] = useState(null);
+
+  const [sessionFilter, setSessionFilter] = useState("ALL");
+  const [selectedReceipt, setSelectedReceipt] = useState(null);
+
   const fileInputRef = useRef(null);
+  const sessionsSectionRef = useRef(null);
+
+  const fetchSessions = useCallback(async (showLoading = false) => {
+    if (showLoading) {
+      setIsLoadingSessions(true);
+    }
+
+    try {
+      const response = await fetch(`${sessionsEndpoint}?limit=50`, {
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(
+          `The parking sessions request returned status ${response.status}.`,
+        );
+      }
+
+      const data = await response.json();
+
+      setSessions(Array.isArray(data.sessions) ? data.sessions : []);
+      setLastUpdated(new Date());
+    } catch (error) {
+      console.error("Failed to load parking sessions:", error);
+    } finally {
+      setIsLoadingSessions(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchSessions(true);
+
+    const refreshTimer = window.setInterval(() => {
+      fetchSessions(false);
+    }, SESSION_REFRESH_INTERVAL);
+
+    return () => {
+      window.clearInterval(refreshTimer);
+    };
+  }, [fetchSessions]);
 
   useEffect(() => {
     return () => {
@@ -22,43 +78,90 @@ function App() {
     };
   }, [previewUrl]);
 
-  function resetImage() {
+  useEffect(() => {
+    document.body.style.overflow = selectedReceipt ? "hidden" : "";
+
+    return () => {
+      document.body.style.overflow = "";
+    };
+  }, [selectedReceipt]);
+
+  useEffect(() => {
+    function handleEscape(event) {
+      if (event.key === "Escape") {
+        setSelectedReceipt(null);
+      }
+    }
+
+    window.addEventListener("keydown", handleEscape);
+
+    return () => {
+      window.removeEventListener("keydown", handleEscape);
+    };
+  }, []);
+
+  function clearSelectedImage() {
     if (previewUrl) {
       URL.revokeObjectURL(previewUrl);
     }
 
     setSelectedImage(null);
     setPreviewUrl("");
-    setErrorMessage("");
-    setSuccessMessage("");
 
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
   }
 
-  function handleOperationChange(selectedOperation) {
-    setOperation(selectedOperation);
-    resetImage();
-  }
-
-  function validateAndSelectImage(file) {
+  function resetImageForm() {
+    clearSelectedImage();
     setErrorMessage("");
     setSuccessMessage("");
+  }
 
+  function handleOperationChange(nextOperation) {
+    setOperation(nextOperation);
+    resetImageForm();
+  }
+
+  function handleSummaryCardClick(filter) {
+    setSessionFilter(filter);
+
+    window.setTimeout(() => {
+      sessionsSectionRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    }, 50);
+  }
+
+  function validateImage(file) {
     if (!file) {
-      return;
+      return "Please select a licence-plate image.";
     }
 
-    const allowedTypes = ["image/jpeg", "image/png", "image/webp"];
-
-    if (!allowedTypes.includes(file.type)) {
-      setErrorMessage("Please select a JPG, PNG or WebP image.");
-      return;
+    if (!file.type.startsWith("image/")) {
+      return "Please select a valid JPG or PNG image.";
     }
 
     if (file.size > MAX_FILE_SIZE) {
-      setErrorMessage("The image must be smaller than 5 MB.");
+      return "The image must be smaller than 5 MB.";
+    }
+
+    return "";
+  }
+
+  function handleImageSelection(event) {
+    const file = event.target.files?.[0];
+
+    setErrorMessage("");
+    setSuccessMessage("");
+
+    const validationError = validateImage(file);
+
+    if (validationError) {
+      clearSelectedImage();
+      setErrorMessage(validationError);
       return;
     }
 
@@ -70,350 +173,822 @@ function App() {
     setPreviewUrl(URL.createObjectURL(file));
   }
 
-  function handleImageChange(event) {
-    validateAndSelectImage(event.target.files[0]);
+  async function requestPresignedUploadUrl() {
+    const response = await fetch(uploadUrlEndpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        operation,
+        fileName: selectedImage.name,
+        fileType: selectedImage.type,
+        contentType: selectedImage.type,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error("The system could not prepare the image upload.");
+    }
+
+    const data = await response.json();
+
+    const uploadUrl = data.uploadUrl ?? data.presignedUrl ?? data.url;
+
+    if (!uploadUrl) {
+      throw new Error(
+        "The image upload service did not return an upload address.",
+      );
+    }
+
+    return uploadUrl;
   }
 
-  function handleDrop(event) {
+  async function uploadImageToS3(uploadUrl) {
+    const response = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: {
+        "Content-Type": selectedImage.type,
+      },
+      body: selectedImage,
+    });
+
+    if (!response.ok) {
+      throw new Error("The image could not be uploaded. Please try again.");
+    }
+  }
+
+  async function handleUpload(event) {
     event.preventDefault();
-    validateAndSelectImage(event.dataTransfer.files[0]);
-  }
 
-  async function handleUpload() {
     setErrorMessage("");
     setSuccessMessage("");
 
-    if (!selectedImage) {
-      setErrorMessage(
-        `Please choose a vehicle ${operation} image before uploading.`,
-      );
-      return;
-    }
+    const validationError = validateImage(selectedImage);
 
-    if (!UPLOAD_URL_ENDPOINT) {
-      setErrorMessage(
-        "The upload API endpoint is not configured. Check the frontend .env file.",
-      );
+    if (validationError) {
+      setErrorMessage(validationError);
       return;
     }
 
     setIsUploading(true);
 
     try {
-      /*
-       * Step 1:
-       * Request a temporary S3 upload URL from API Gateway and Lambda.
-       */
-      const urlResponse = await fetch(UPLOAD_URL_ENDPOINT, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          operation,
-          contentType: selectedImage.type,
-        }),
-      });
+      const uploadUrl = await requestPresignedUploadUrl();
 
-      const responseText = await urlResponse.text();
+      await uploadImageToS3(uploadUrl);
 
-      let urlData;
-
-      try {
-        urlData = responseText ? JSON.parse(responseText) : {};
-      } catch {
-        throw new Error("The upload API returned an invalid response.");
-      }
-
-      if (!urlResponse.ok) {
-        throw new Error(
-          urlData.message ||
-            `Could not create an upload URL. Status: ${urlResponse.status}`,
-        );
-      }
-
-      if (!urlData.uploadUrl || !urlData.objectKey) {
-        throw new Error(
-          "The upload API did not return the required upload information.",
-        );
-      }
-
-      /*
-       * Step 2:
-       * Upload the selected image directly to the private S3 bucket.
-       */
-      const uploadResponse = await fetch(urlData.uploadUrl, {
-        method: "PUT",
-        headers: {
-          "Content-Type": selectedImage.type,
-        },
-        body: selectedImage,
-      });
-
-      if (!uploadResponse.ok) {
-        throw new Error(
-          `The image could not be uploaded to S3. Status: ${uploadResponse.status}`,
-        );
-      }
-
-      console.log("Image uploaded successfully:", {
-        operation,
-        objectKey: urlData.objectKey,
-      });
+      clearSelectedImage();
 
       setSuccessMessage(
-        `Vehicle ${operation} image uploaded successfully.`,
+        operation === "entry"
+          ? "Vehicle entry image uploaded successfully. The parking session is being created."
+          : "Vehicle exit image uploaded successfully. The parking session is being completed.",
       );
+
+      window.setTimeout(() => {
+        fetchSessions(false);
+      }, 4000);
     } catch (error) {
       console.error("Image upload failed:", error);
 
       setErrorMessage(
         error instanceof Error
           ? error.message
-          : "The image could not be uploaded.",
+          : "The image could not be uploaded. Please try again.",
       );
     } finally {
       setIsUploading(false);
     }
   }
 
-  const isEntry = operation === "entry";
+  function formatDateTime(value) {
+    if (!value) {
+      return "Not available";
+    }
+
+    const date = new Date(value);
+
+    if (Number.isNaN(date.getTime())) {
+      return "Not available";
+    }
+
+    return new Intl.DateTimeFormat("en-ZA", {
+      dateStyle: "medium",
+      timeStyle: "short",
+    }).format(date);
+  }
+
+  function formatCurrency(value) {
+    const amount = Number(value ?? 0);
+
+    return new Intl.NumberFormat("en-ZA", {
+      style: "currency",
+      currency: "ZAR",
+    }).format(Number.isFinite(amount) ? amount : 0);
+  }
+
+  function getStatusClass(status) {
+    switch (status) {
+      case "ACTIVE":
+        return "status-badge status-active";
+      case "COMPLETED":
+        return "status-badge status-completed";
+      case "FLAGGED":
+        return "status-badge status-flagged";
+      default:
+        return "status-badge";
+    }
+  }
+
+  function getStatusLabel(status) {
+    switch (status) {
+      case "ACTIVE":
+        return "Active";
+      case "COMPLETED":
+        return "Completed";
+      case "FLAGGED":
+        return "Needs review";
+      default:
+        return status || "Unknown";
+    }
+  }
+
+  function getSessionsHeading() {
+    switch (sessionFilter) {
+      case "ACTIVE":
+        return "Vehicles currently parked";
+      case "COMPLETED":
+        return "Completed parking sessions";
+      case "FEES":
+        return "Parking fees and receipts";
+      default:
+        return "All parking sessions";
+    }
+  }
+
+  function buildReceiptHtml(session) {
+    return `
+      <!DOCTYPE html>
+      <html lang="en">
+        <head>
+          <meta charset="UTF-8" />
+          <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1.0"
+          />
+
+          <title>${session.receipt_number}</title>
+
+          <style>
+            body {
+              margin: 0;
+              padding: 40px;
+              color: #10213f;
+              background: #f4f7fb;
+              font-family: Arial, sans-serif;
+            }
+
+            .receipt {
+              max-width: 680px;
+              margin: 0 auto;
+              overflow: hidden;
+              border: 1px solid #dfe7f2;
+              border-radius: 18px;
+              background: white;
+            }
+
+            .header {
+              padding: 30px;
+              color: white;
+              background: linear-gradient(120deg, #071b42, #1766d1);
+            }
+
+            .header p {
+              margin: 0 0 8px;
+              font-size: 12px;
+              font-weight: bold;
+              letter-spacing: 2px;
+              text-transform: uppercase;
+            }
+
+            .header h1 {
+              margin: 0;
+            }
+
+            .content {
+              padding: 30px;
+            }
+
+            .row {
+              display: flex;
+              justify-content: space-between;
+              gap: 30px;
+              padding: 14px 0;
+              border-bottom: 1px solid #e6edf5;
+            }
+
+            .label {
+              color: #687990;
+            }
+
+            .value {
+              text-align: right;
+              font-weight: bold;
+            }
+
+            .total {
+              margin-top: 20px;
+              padding: 20px;
+              border-radius: 12px;
+              background: #edf3ff;
+            }
+
+            .total .value {
+              color: #1559c6;
+              font-size: 26px;
+            }
+
+            .footer {
+              padding: 20px;
+              color: #6d7c90;
+              background: #f7f9fc;
+              text-align: center;
+            }
+
+            @media print {
+              body {
+                padding: 0;
+                background: white;
+              }
+
+              .receipt {
+                border: 0;
+              }
+            }
+          </style>
+        </head>
+
+        <body>
+          <main class="receipt">
+            <header class="header">
+              <p>NB Ticketless Parking System</p>
+              <h1>Parking Receipt</h1>
+            </header>
+
+            <section class="content">
+              <div class="row">
+                <span class="label">Receipt number</span>
+                <span class="value">${session.receipt_number}</span>
+              </div>
+
+              <div class="row">
+                <span class="label">Licence plate</span>
+                <span class="value">${session.license_plate}</span>
+              </div>
+
+              <div class="row">
+                <span class="label">Entry date and time</span>
+                <span class="value">
+                  ${formatDateTime(session.entry_timestamp)}
+                </span>
+              </div>
+
+              <div class="row">
+                <span class="label">Exit date and time</span>
+                <span class="value">
+                  ${formatDateTime(session.exit_timestamp)}
+                </span>
+              </div>
+
+              <div class="row">
+                <span class="label">Parking duration</span>
+                <span class="value">
+                  ${session.duration_minutes} minutes
+                </span>
+              </div>
+
+              <div class="row">
+                <span class="label">Hourly rate</span>
+                <span class="value">
+                  ${formatCurrency(session.hourly_rate)}
+                </span>
+              </div>
+
+              <div class="row">
+                <span class="label">Status</span>
+                <span class="value">Paid</span>
+              </div>
+
+              <div class="row total">
+                <span class="label">Total parking fee</span>
+                <span class="value">
+                  ${formatCurrency(session.calculated_fee)}
+                </span>
+              </div>
+            </section>
+
+            <footer class="footer">
+              Thank you for using NB Ticketless Parking System.
+            </footer>
+          </main>
+        </body>
+      </html>
+    `;
+  }
+
+  function downloadReceipt(session) {
+    const receiptBlob = new Blob([buildReceiptHtml(session)], {
+      type: "text/html;charset=utf-8",
+    });
+
+    const receiptUrl = URL.createObjectURL(receiptBlob);
+    const link = document.createElement("a");
+
+    link.href = receiptUrl;
+    link.download = `${session.receipt_number}.html`;
+
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    URL.revokeObjectURL(receiptUrl);
+  }
+
+  function printReceipt(session) {
+    const receiptWindow = window.open("", "_blank", "width=800,height=900");
+
+    if (!receiptWindow) {
+      return;
+    }
+
+    receiptWindow.document.open();
+    receiptWindow.document.write(buildReceiptHtml(session));
+    receiptWindow.document.close();
+
+    receiptWindow.onload = () => {
+      receiptWindow.focus();
+      receiptWindow.print();
+    };
+  }
+
+  const activeSessions = sessions.filter(
+    (session) => session.session_status === "ACTIVE",
+  ).length;
+
+  const completedSessions = sessions.filter(
+    (session) => session.session_status === "COMPLETED",
+  ).length;
+
+  const totalFees = sessions.reduce((total, session) => {
+    return total + Number(session.calculated_fee ?? 0);
+  }, 0);
+
+  const filteredSessions = sessions.filter((session) => {
+    switch (sessionFilter) {
+      case "ACTIVE":
+        return session.session_status === "ACTIVE";
+
+      case "COMPLETED":
+        return session.session_status === "COMPLETED";
+
+      case "FEES":
+        return session.session_status === "COMPLETED" && session.receipt_number;
+
+      default:
+        return true;
+    }
+  });
 
   return (
     <div className="app-shell">
-      <header className="app-header">
-        <div className="brand">
-          <div className="brand-icon" aria-hidden="true">
-            P
-          </div>
+      <header className="topbar">
+        <div>
+          <p className="eyebrow">NB Ticketless Parking System</p>
 
-          <div>
-            <p className="brand-name">ParkFlow</p>
-            <p className="brand-description">
-              Ticketless Parking Management
-            </p>
-          </div>
+          <h1>Vehicle Parking Dashboard</h1>
+
+          <p className="header-description">
+            Upload vehicle licence plates and monitor parking sessions in real
+            time.
+          </p>
         </div>
 
-        <div className="system-status">
-          <span className="status-dot" />
+        <div className="live-indicator">
+          <span className="live-dot" />
           System online
         </div>
       </header>
 
-      <main className="page-content">
-        <section className="hero-section">
-          <p className="eyebrow">Smart parking operations</p>
+      <main className="dashboard">
+        <section className="summary-grid">
+          <button
+            type="button"
+            className={
+              sessionFilter === "ALL"
+                ? "summary-card summary-card-button selected"
+                : "summary-card summary-card-button"
+            }
+            onClick={() => handleSummaryCardClick("ALL")}
+          >
+            <span>Total sessions</span>
+            <strong>{sessions.length}</strong>
+            <small>View all parking sessions</small>
+          </button>
 
-          <h1>Capture a vehicle movement</h1>
+          <button
+            type="button"
+            className={
+              sessionFilter === "ACTIVE"
+                ? "summary-card summary-card-button selected"
+                : "summary-card summary-card-button"
+            }
+            onClick={() => handleSummaryCardClick("ACTIVE")}
+          >
+            <span>Vehicles currently parked</span>
+            <strong>{activeSessions}</strong>
+            <small>View active vehicles</small>
+          </button>
 
-          <p className="hero-description">
-            Select whether the vehicle is entering or exiting, then upload a
-            clear image of its licence plate.
-          </p>
+          <button
+            type="button"
+            className={
+              sessionFilter === "COMPLETED"
+                ? "summary-card summary-card-button selected"
+                : "summary-card summary-card-button"
+            }
+            onClick={() => handleSummaryCardClick("COMPLETED")}
+          >
+            <span>Completed sessions</span>
+            <strong>{completedSessions}</strong>
+            <small>View completed sessions</small>
+          </button>
+
+          <button
+            type="button"
+            className={
+              sessionFilter === "FEES"
+                ? "summary-card summary-card-button selected"
+                : "summary-card summary-card-button"
+            }
+            onClick={() => handleSummaryCardClick("FEES")}
+          >
+            <span>Total parking fees</span>
+            <strong>{formatCurrency(totalFees)}</strong>
+            <small>View fees and receipts</small>
+          </button>
         </section>
 
-        <section className="parking-card">
-          <div className="section-heading">
-            <div>
-              <span className="step-number">1</span>
-              <h2>Select parking operation</h2>
-            </div>
-
-            <p>Choose the correct vehicle movement.</p>
-          </div>
-
-          <div className="operation-grid">
-            <button
-              type="button"
-              className={`operation-card ${
-                isEntry ? "operation-card--active" : ""
-              }`}
-              onClick={() => handleOperationChange("entry")}
-              aria-pressed={isEntry}
-              disabled={isUploading}
-            >
-              <span className="operation-icon operation-icon--entry">
-                <svg
-                  viewBox="0 0 24 24"
-                  aria-hidden="true"
-                  focusable="false"
-                >
-                  <path d="M10 17l5-5-5-5v10z" />
-                  <path d="M19 19H5V5h14v4h-2V7H7v10h10v-2h2v4z" />
-                </svg>
-              </span>
-
-              <span className="operation-content">
-                <strong>Vehicle Entry</strong>
-                <span>
-                  Register a vehicle entering the parking facility.
-                </span>
-              </span>
-
-              <span className="selection-indicator">
-                {isEntry ? "✓" : ""}
-              </span>
-            </button>
-
-            <button
-              type="button"
-              className={`operation-card ${
-                !isEntry ? "operation-card--active" : ""
-              }`}
-              onClick={() => handleOperationChange("exit")}
-              aria-pressed={!isEntry}
-              disabled={isUploading}
-            >
-              <span className="operation-icon operation-icon--exit">
-                <svg
-                  viewBox="0 0 24 24"
-                  aria-hidden="true"
-                  focusable="false"
-                >
-                  <path d="M14 7l-5 5 5 5V7z" />
-                  <path d="M5 5h14v14H5v-4h2v2h10V7H7v2H5V5z" />
-                </svg>
-              </span>
-
-              <span className="operation-content">
-                <strong>Vehicle Exit</strong>
-                <span>Complete an active parking session.</span>
-              </span>
-
-              <span className="selection-indicator">
-                {!isEntry ? "✓" : ""}
-              </span>
-            </button>
-          </div>
-
-          <div className="divider" />
-
-          <div className="section-heading">
-            <div>
-              <span className="step-number">2</span>
-
-              <h2>
-                Upload vehicle {isEntry ? "entry" : "exit"} image
-              </h2>
-            </div>
-
-            <p>Use a clear image where the licence plate is visible.</p>
-          </div>
-
-          {!selectedImage ? (
-            <div
-              className="upload-zone"
-              onDragOver={(event) => event.preventDefault()}
-              onDrop={handleDrop}
-            >
-              <div className="upload-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24" focusable="false">
-                  <path d="M19 13v6H5v-6H3v6c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2v-6h-2z" />
-                  <path d="M11 16h2V8h3l-4-4-4 4h3v8z" />
-                </svg>
+        <section className="content-grid">
+          <article className="panel upload-panel">
+            <div className="panel-heading">
+              <div>
+                <p className="section-label">Vehicle check-in and exit</p>
+                <h2>Upload a licence-plate image</h2>
               </div>
+            </div>
 
-              <h3>Upload licence plate image</h3>
+            <div className="operation-tabs">
+              <button
+                type="button"
+                className={
+                  operation === "entry"
+                    ? "operation-button active"
+                    : "operation-button"
+                }
+                onClick={() => handleOperationChange("entry")}
+              >
+                Vehicle entry
+              </button>
 
-              <p>
-                Drag and drop an image here, or browse your computer.
-              </p>
+              <button
+                type="button"
+                className={
+                  operation === "exit"
+                    ? "operation-button active"
+                    : "operation-button"
+                }
+                onClick={() => handleOperationChange("exit")}
+              >
+                Vehicle exit
+              </button>
+            </div>
 
-              <label className="browse-button">
-                Choose image
+            <form onSubmit={handleUpload}>
+              <label className="upload-area" htmlFor="vehicle-image">
+                {previewUrl ? (
+                  <img
+                    src={previewUrl}
+                    alt="Selected vehicle licence plate"
+                    className="image-preview"
+                  />
+                ) : (
+                  <div className="upload-placeholder">
+                    <span className="upload-icon">↑</span>
+                    <strong>Select a licence-plate image</strong>
+                    <small>JPG, JPEG or PNG — maximum size 5 MB</small>
+                  </div>
+                )}
 
                 <input
                   ref={fileInputRef}
+                  id="vehicle-image"
                   type="file"
-                  accept="image/jpeg,image/png,image/webp"
-                  onChange={handleImageChange}
-                  disabled={isUploading}
+                  accept="image/png,image/jpeg,image/jpg"
+                  onChange={handleImageSelection}
+                  hidden
                 />
               </label>
 
-              <span className="file-guidance">
-                JPG, PNG or WebP · Maximum 5 MB
-              </span>
-            </div>
-          ) : (
-            <div className="image-preview-card">
-              <div className="image-preview-wrapper">
-                <img
-                  src={previewUrl}
-                  alt={`Vehicle ${operation} licence plate preview`}
-                />
+              {selectedImage && (
+                <div className="selected-file-row">
+                  <div>
+                    <strong>{selectedImage.name}</strong>
+                    <small>{(selectedImage.size / 1024).toFixed(1)} KB</small>
+                  </div>
 
-                <span
-                  className={`operation-badge ${
-                    isEntry
-                      ? "operation-badge--entry"
-                      : "operation-badge--exit"
-                  }`}
-                >
-                  {isEntry ? "Entry image" : "Exit image"}
-                </span>
-              </div>
-
-              <div className="file-details">
-                <div>
-                  <p className="file-name">{selectedImage.name}</p>
-
-                  <p className="file-size">
-                    {(selectedImage.size / 1024 / 1024).toFixed(2)} MB
-                  </p>
+                  <button
+                    type="button"
+                    className="text-button"
+                    onClick={resetImageForm}
+                  >
+                    Remove
+                  </button>
                 </div>
+              )}
 
-                <button
-                  type="button"
-                  className="remove-button"
-                  onClick={resetImage}
-                  disabled={isUploading}
-                >
-                  Remove
-                </button>
+              {errorMessage && (
+                <div className="message error-message">{errorMessage}</div>
+              )}
+
+              {successMessage && (
+                <div className="message success-message">{successMessage}</div>
+              )}
+
+              <button
+                type="submit"
+                className="primary-button"
+                disabled={!selectedImage || isUploading}
+              >
+                {isUploading
+                  ? "Uploading image..."
+                  : operation === "entry"
+                    ? "Start parking session"
+                    : "Complete parking session"}
+              </button>
+            </form>
+          </article>
+
+          <article className="panel information-panel">
+            <p className="section-label">How it works</p>
+
+            <h2>
+              {operation === "entry"
+                ? "Start a parking session"
+                : "Complete a parking session"}
+            </h2>
+
+            <div className="process-list">
+              <div className="process-item">
+                <span>1</span>
+                <p>Upload a clear photo of the vehicle&apos;s licence plate.</p>
+              </div>
+
+              <div className="process-item">
+                <span>2</span>
+                <p>
+                  {operation === "entry"
+                    ? "The system reads the licence plate automatically."
+                    : "The system reads the licence plate and finds the matching parking session."}
+                </p>
+              </div>
+
+              <div className="process-item">
+                <span>3</span>
+                <p>
+                  {operation === "entry"
+                    ? "A parking session is started and the vehicle is recorded."
+                    : "The parking fee is calculated and the session is completed."}
+                </p>
               </div>
             </div>
-          )}
+          </article>
+        </section>
 
-          {errorMessage && (
-            <div className="error-message" role="alert">
-              {errorMessage}
-            </div>
-          )}
+        <section ref={sessionsSectionRef} className="panel sessions-panel">
+          <div className="panel-heading sessions-heading">
+            <div>
+              <p className="section-label">Vehicle activity</p>
+              <h2>{getSessionsHeading()}</h2>
 
-          {successMessage && (
-            <div className="success-message" role="status">
-              {successMessage}
-            </div>
-          )}
-
-          <div className="action-area">
-            <div className="security-note">
-              <span aria-hidden="true">🔒</span>
-              Images will be uploaded securely to AWS.
+              <p className="last-updated">
+                {lastUpdated
+                  ? `Last updated at ${lastUpdated.toLocaleTimeString("en-ZA")}`
+                  : "Waiting for parking session information"}
+              </p>
             </div>
 
             <button
               type="button"
-              className="upload-button"
-              onClick={handleUpload}
-              disabled={!selectedImage || isUploading}
+              className="refresh-button"
+              onClick={() => fetchSessions(true)}
+              disabled={isLoadingSessions}
             >
-              {isUploading
-                ? "Uploading..."
-                : `Upload ${isEntry ? "Entry" : "Exit"} Image`}
-
-              {!isUploading && <span aria-hidden="true">→</span>}
+              {isLoadingSessions ? "Refreshing..." : "Refresh sessions"}
             </button>
           </div>
-        </section>
 
-        <footer className="page-footer">
-          <p>ParkFlow Ticketless Parking System</p>
-          <p>Powered by AWS cloud services</p>
-        </footer>
+          {isLoadingSessions && sessions.length === 0 ? (
+            <div className="empty-state">
+              <p>Loading parking sessions...</p>
+            </div>
+          ) : filteredSessions.length === 0 ? (
+            <div className="empty-state">
+              <h3>No matching parking sessions</h3>
+              <p>No information is currently available for this category.</p>
+            </div>
+          ) : (
+            <div className="table-container">
+              <table className="sessions-table">
+                <thead>
+                  <tr>
+                    <th>Licence plate</th>
+                    <th>Status</th>
+                    <th>Entry time</th>
+                    <th>Exit time</th>
+                    <th>Parking time</th>
+                    <th>Fee</th>
+                    <th>Receipt</th>
+                  </tr>
+                </thead>
+
+                <tbody>
+                  {filteredSessions.map((session) => (
+                    <tr key={session.session_id}>
+                      <td>
+                        <strong className="plate-number">
+                          {session.license_plate}
+                        </strong>
+                      </td>
+
+                      <td>
+                        <span
+                          className={getStatusClass(session.session_status)}
+                        >
+                          {getStatusLabel(session.session_status)}
+                        </span>
+                      </td>
+
+                      <td>{formatDateTime(session.entry_timestamp)}</td>
+
+                      <td>
+                        {session.exit_timestamp
+                          ? formatDateTime(session.exit_timestamp)
+                          : "Not exited"}
+                      </td>
+
+                      <td>
+                        {session.duration_minutes
+                          ? `${session.duration_minutes} minutes`
+                          : "Still parked"}
+                      </td>
+
+                      <td>
+                        {session.session_status === "ACTIVE"
+                          ? "Calculating..."
+                          : formatCurrency(session.calculated_fee)}
+                      </td>
+
+                      <td>
+                        {session.receipt_number ? (
+                          <button
+                            type="button"
+                            className="receipt-link-button"
+                            onClick={() => setSelectedReceipt(session)}
+                          >
+                            Open receipt
+                          </button>
+                        ) : (
+                          "Available after exit"
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
       </main>
+
+      {selectedReceipt && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setSelectedReceipt(null);
+            }
+          }}
+        >
+          <section
+            className="modal-card receipt-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="receipt-title"
+          >
+            <header className="receipt-modal-header">
+              <div>
+                <p>NB Ticketless Parking System</p>
+                <h2 id="receipt-title">Parking Receipt</h2>
+              </div>
+
+              <button
+                type="button"
+                className="receipt-close-button"
+                onClick={() => setSelectedReceipt(null)}
+                aria-label="Close receipt"
+              >
+                ×
+              </button>
+            </header>
+
+            <div className="receipt-body">
+              <div className="receipt-row">
+                <span>Receipt number</span>
+                <strong>{selectedReceipt.receipt_number}</strong>
+              </div>
+
+              <div className="receipt-row">
+                <span>Licence plate</span>
+                <strong>{selectedReceipt.license_plate}</strong>
+              </div>
+
+              <div className="receipt-row">
+                <span>Entry date and time</span>
+                <strong>
+                  {formatDateTime(selectedReceipt.entry_timestamp)}
+                </strong>
+              </div>
+
+              <div className="receipt-row">
+                <span>Exit date and time</span>
+                <strong>
+                  {formatDateTime(selectedReceipt.exit_timestamp)}
+                </strong>
+              </div>
+
+              <div className="receipt-row">
+                <span>Parking duration</span>
+                <strong>{selectedReceipt.duration_minutes} minutes</strong>
+              </div>
+
+              <div className="receipt-row">
+                <span>Hourly rate</span>
+                <strong>{formatCurrency(selectedReceipt.hourly_rate)}</strong>
+              </div>
+
+              <div className="receipt-row">
+                <span>Status</span>
+                <strong>Paid</strong>
+              </div>
+
+              <div className="receipt-total">
+                <span>Total parking fee</span>
+                <strong>
+                  {formatCurrency(selectedReceipt.calculated_fee)}
+                </strong>
+              </div>
+            </div>
+
+            <footer className="receipt-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => setSelectedReceipt(null)}
+              >
+                Close
+              </button>
+
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => printReceipt(selectedReceipt)}
+              >
+                Print or save as PDF
+              </button>
+
+              <button
+                type="button"
+                className="primary-action-button"
+                onClick={() => downloadReceipt(selectedReceipt)}
+              >
+                Download receipt
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
     </div>
   );
 }
