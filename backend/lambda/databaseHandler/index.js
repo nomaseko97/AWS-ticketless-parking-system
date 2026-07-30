@@ -130,6 +130,221 @@ function createReceiptNumber(sessionId, exitTimestamp) {
   return `PF-${datePart}-${sessionPart}`;
 }
 
+async function saveProcessingResult({
+  imageKey,
+  operation,
+  plateNumber = null,
+  processingStatus,
+  message,
+  httpStatus,
+}) {
+  if (!imageKey) {
+    console.warn(
+      "Processing result was not stored because imageKey is missing.",
+    );
+
+    return null;
+  }
+
+  /*
+   * A SUCCESS result is final. S3 can deliver the same event more than once,
+   * so a later duplicate attempt must never replace SUCCESS with REJECTED
+   * or FAILED.
+   */
+  const result = await pool.query(
+    `
+      INSERT INTO processing_results (
+        image_key,
+        operation,
+        plate_number,
+        processing_status,
+        result_message,
+        http_status,
+        updated_at
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4,
+        $5,
+        $6,
+        CURRENT_TIMESTAMP
+      )
+
+      ON CONFLICT (image_key)
+      DO UPDATE SET
+        operation = EXCLUDED.operation,
+        plate_number = COALESCE(
+          EXCLUDED.plate_number,
+          processing_results.plate_number
+        ),
+        processing_status = EXCLUDED.processing_status,
+        result_message = EXCLUDED.result_message,
+        http_status = EXCLUDED.http_status,
+        updated_at = CURRENT_TIMESTAMP
+
+      WHERE
+        processing_results.processing_status <> 'SUCCESS'
+        OR EXCLUDED.processing_status = 'SUCCESS'
+
+      RETURNING
+        result_id,
+        image_key,
+        operation,
+        plate_number,
+        processing_status,
+        result_message,
+        http_status,
+        created_at,
+        updated_at;
+    `,
+    [imageKey, operation, plateNumber, processingStatus, message, httpStatus],
+  );
+
+  if (result.rowCount === 0) {
+    const existingResult = await pool.query(
+      `
+        SELECT
+          result_id,
+          image_key,
+          operation,
+          plate_number,
+          processing_status,
+          result_message,
+          http_status,
+          created_at,
+          updated_at
+        FROM processing_results
+        WHERE image_key = $1
+        LIMIT 1;
+      `,
+      [imageKey],
+    );
+
+    console.log(
+      "Existing successful processing result preserved:",
+      JSON.stringify(existingResult.rows[0]),
+    );
+
+    return existingResult.rows[0] ?? null;
+  }
+
+  console.log("Processing result stored:", JSON.stringify(result.rows[0]));
+
+  return result.rows[0];
+}
+
+async function claimProcessing(event) {
+  const imageKey = validateImageKey(event.imageKey);
+
+  const operation =
+    event.operation === "entry" || event.operation === "exit"
+      ? event.operation
+      : "unknown";
+
+  const insertResult = await pool.query(
+    `
+      INSERT INTO processing_results (
+        image_key,
+        operation,
+        plate_number,
+        processing_status,
+        result_message,
+        http_status,
+        updated_at
+      )
+      VALUES (
+        $1,
+        $2,
+        NULL,
+        'PENDING',
+        'The licence plate image is still being processed.',
+        202,
+        CURRENT_TIMESTAMP
+      )
+      ON CONFLICT (image_key) DO NOTHING
+      RETURNING
+        result_id,
+        image_key,
+        operation,
+        plate_number,
+        processing_status,
+        result_message,
+        http_status,
+        created_at,
+        updated_at;
+    `,
+    [imageKey, operation],
+  );
+
+  if (insertResult.rowCount === 1) {
+    return {
+      shouldProcess: true,
+      existingResult: insertResult.rows[0],
+    };
+  }
+
+  const existingResult = await pool.query(
+    `
+      SELECT
+        result_id,
+        image_key,
+        operation,
+        plate_number,
+        processing_status,
+        result_message,
+        http_status,
+        created_at,
+        updated_at
+      FROM processing_results
+      WHERE image_key = $1
+      LIMIT 1;
+    `,
+    [imageKey],
+  );
+
+  return {
+    shouldProcess: false,
+    existingResult: existingResult.rows[0] ?? null,
+  };
+}
+
+async function recordProcessingResult(event) {
+  const imageKey = validateImageKey(event.imageKey);
+
+  const operation =
+    event.operation === "entry" || event.operation === "exit"
+      ? event.operation
+      : "unknown";
+
+  const allowedStatuses = new Set(["PENDING", "SUCCESS", "REJECTED", "FAILED"]);
+
+  const processingStatus = String(event.processingStatus ?? "").toUpperCase();
+
+  if (!allowedStatuses.has(processingStatus)) {
+    throw new ApplicationError(400, "Invalid processing status.");
+  }
+
+  const message =
+    typeof event.message === "string" && event.message.trim()
+      ? event.message.trim()
+      : "The parking operation could not be completed. Please try again.";
+
+  const httpStatus = Number(event.httpStatus ?? 500);
+
+  return saveProcessingResult({
+    imageKey,
+    operation,
+    plateNumber: event.plateNumber
+      ? normalisePlateNumber(event.plateNumber)
+      : null,
+    processingStatus,
+    message,
+    httpStatus: Number.isInteger(httpStatus) ? httpStatus : 500,
+  });
+}
+
 async function initialiseDatabase() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS parking_sessions (
@@ -262,10 +477,77 @@ async function initialiseDatabase() {
     WHERE receipt_number IS NOT NULL;
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS processing_results (
+      result_id UUID
+        PRIMARY KEY
+        DEFAULT gen_random_uuid(),
+
+      image_key TEXT
+        NOT NULL UNIQUE,
+
+      operation VARCHAR(20)
+        NOT NULL,
+
+      plate_number VARCHAR(15),
+
+      processing_status VARCHAR(20)
+        NOT NULL,
+
+      result_message TEXT
+        NOT NULL,
+
+      http_status INTEGER
+        NOT NULL,
+
+      created_at TIMESTAMP WITH TIME ZONE
+        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+      updated_at TIMESTAMP WITH TIME ZONE
+        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+      CONSTRAINT valid_processing_operation
+        CHECK (
+          operation IN (
+            'entry',
+            'exit',
+            'unknown'
+          )
+        ),
+
+      CONSTRAINT valid_processing_status
+        CHECK (
+          processing_status IN (
+            'PENDING',
+            'SUCCESS',
+            'REJECTED',
+            'FAILED'
+          )
+        )
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_processing_results_status
+    ON processing_results (
+      processing_status
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_processing_results_updated
+    ON processing_results (
+      updated_at DESC
+    );
+  `);
+
   return {
     message: "Database initialised successfully.",
 
-    table: "parking_sessions",
+    tables: ["parking_sessions", "processing_results"],
+
     hourlyRate: HOURLY_RATE,
     currency: "ZAR",
   };
@@ -296,6 +578,8 @@ async function createEntrySession(event) {
   const confidence = parseConfidence(event.confidence);
 
   const reviewRequired = requiresManualReview(confidence);
+
+  console.log(`Creating entry session for ${plateNumber}.`);
 
   const result = await pool.query(
     `
@@ -333,11 +617,24 @@ async function createEntrySession(event) {
     [plateNumber, imageKey, HOURLY_RATE, confidence, reviewRequired],
   );
 
-  return {
-    message: "Parking entry session created.",
+  const response = {
+    message: "The vehicle has successfully entered the parking area.",
 
     session: result.rows[0],
   };
+
+  await saveProcessingResult({
+    imageKey,
+    operation: "entry",
+    plateNumber,
+    processingStatus: "SUCCESS",
+    message: response.message,
+    httpStatus: 200,
+  });
+
+  console.log("Parking entry session created:", JSON.stringify(result.rows[0]));
+
+  return response;
 }
 
 async function completeExitSession(event) {
@@ -378,7 +675,7 @@ async function completeExitSession(event) {
     if (activeSessionResult.rowCount === 0) {
       throw new ApplicationError(
         404,
-        `No active parking session was found for ${plateNumber}.`,
+        "No active parking session was found for this vehicle.",
       );
     }
 
@@ -468,8 +765,8 @@ async function completeExitSession(event) {
 
     await client.query("COMMIT");
 
-    return {
-      message: "Parking exit completed.",
+    const response = {
+      message: "The vehicle has successfully exited the parking area.",
 
       session: completedSessionResult.rows[0],
 
@@ -481,6 +778,18 @@ async function completeExitSession(event) {
         totalFee: calculatedFee,
       },
     };
+
+    await saveProcessingResult({
+      imageKey,
+      operation: "exit",
+      plateNumber,
+      processingStatus: "SUCCESS",
+      message:
+        "The vehicle has successfully exited the parking area. The parking receipt is now available.",
+      httpStatus: 200,
+    });
+
+    return response;
   } catch (error) {
     await client.query("ROLLBACK");
 
@@ -540,6 +849,61 @@ async function listParkingSessions(event) {
   };
 }
 
+async function getProcessingStatus(event) {
+  const imageKey = event.imageKey ?? event.queryStringParameters?.imageKey;
+
+  if (!imageKey) {
+    throw new ApplicationError(400, "The image key is required.");
+  }
+
+  const result = await pool.query(
+    `
+      SELECT
+        result_id,
+        image_key,
+        operation,
+        plate_number,
+        processing_status,
+        result_message,
+        http_status,
+        created_at,
+        updated_at
+
+      FROM processing_results
+
+      WHERE image_key = $1
+
+      LIMIT 1;
+    `,
+    [imageKey],
+  );
+
+  if (result.rowCount === 0) {
+    return {
+      processingStatus: "PENDING",
+      message: "The licence plate image is still being processed.",
+    };
+  }
+
+  const row = result.rows[0];
+
+  return {
+    processingStatus: row.processing_status,
+
+    message: row.result_message,
+
+    httpStatus: row.http_status,
+
+    operation: row.operation,
+
+    plateNumber: row.plate_number,
+
+    imageKey: row.image_key,
+
+    updatedAt: row.updated_at,
+  };
+}
+
 function isGetSessionsRequest(event) {
   const httpMethod = event.requestContext?.http?.method;
 
@@ -553,6 +917,19 @@ function isGetSessionsRequest(event) {
   );
 }
 
+function isGetProcessingStatusRequest(event) {
+  const httpMethod = event.requestContext?.http?.method;
+
+  const rawPath = event.rawPath;
+
+  const routeKey = event.routeKey;
+
+  return (
+    routeKey === "GET /processing-status" ||
+    (httpMethod === "GET" && rawPath === "/processing-status")
+  );
+}
+
 export const handler = async (event = {}, context) => {
   if (context) {
     context.callbackWaitsForEmptyEventLoop = false;
@@ -562,9 +939,13 @@ export const handler = async (event = {}, context) => {
 
   const apiGatewaySessionsRequest = isGetSessionsRequest(event);
 
+  const apiGatewayStatusRequest = isGetProcessingStatusRequest(event);
+
   const action = apiGatewaySessionsRequest
     ? "list"
-    : (event.action ?? "health");
+    : apiGatewayStatusRequest
+      ? "processingStatus"
+      : (event.action ?? "health");
 
   const request = apiGatewaySessionsRequest
     ? {
@@ -600,28 +981,85 @@ export const handler = async (event = {}, context) => {
         result = await listParkingSessions(request);
         break;
 
+      case "processingStatus":
+        result = await getProcessingStatus(request);
+        break;
+
+      case "claimProcessing":
+        result = await claimProcessing(request);
+        break;
+
+      case "recordProcessingResult":
+        result = await recordProcessingResult(request);
+        break;
+
       default:
         throw new ApplicationError(400, "Unsupported database action.");
     }
 
     return createResponse(200, result);
   } catch (error) {
-    console.error("Database operation failed:", error);
+    console.error("Database operation failed:", {
+      name: error.name,
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+      constraint: error.constraint,
+      stack: error.stack,
+    });
+
+    let statusCode;
+    let userMessage;
+    let processingStatus;
 
     if (error.code === "23505") {
-      return createResponse(409, {
-        message: "This vehicle already has an active parking session.",
-      });
+      statusCode = 409;
+
+      userMessage =
+        "This vehicle is already in the parking area. Please check the vehicle out before attempting another entry.";
+
+      processingStatus = "REJECTED";
+    } else if (error instanceof ApplicationError) {
+      statusCode = error.statusCode;
+
+      userMessage = error.message;
+
+      processingStatus = "REJECTED";
+    } else {
+      statusCode = 500;
+
+      userMessage =
+        "The parking operation could not be completed. Please try again.";
+
+      processingStatus = "FAILED";
     }
 
-    const statusCode =
-      error instanceof ApplicationError ? error.statusCode : 500;
+    try {
+      await saveProcessingResult({
+        imageKey: request.imageKey,
+
+        operation:
+          request.action === "exit"
+            ? "exit"
+            : request.action === "entry"
+              ? "entry"
+              : "unknown",
+
+        plateNumber: request.plateNumber
+          ? normalisePlateNumber(request.plateNumber)
+          : null,
+
+        processingStatus,
+        message: userMessage,
+        httpStatus: statusCode,
+      });
+    } catch (loggingError) {
+      console.error("Failed to store processing result:", loggingError);
+    }
 
     return createResponse(statusCode, {
-      message:
-        error instanceof ApplicationError
-          ? error.message
-          : "Database operation failed.",
+      processingStatus,
+      message: userMessage,
 
       error: statusCode === 500 ? error.message : undefined,
     });

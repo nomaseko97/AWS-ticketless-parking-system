@@ -5,10 +5,11 @@ const apiBaseUrl = import.meta.env.VITE_API_BASE_URL;
 
 const uploadUrlEndpoint = `${apiBaseUrl}/upload-url`;
 const sessionsEndpoint = `${apiBaseUrl}/sessions`;
+const processingStatusEndpoint = `${apiBaseUrl}/processing-status`;
 
 const MAX_FILE_SIZE = 5 * 1024 * 1024;
-const SESSION_REFRESH_INTERVAL = 10000;
-const PROCESSING_REFRESH_DELAY = 4000;
+const PROCESSING_POLL_INTERVAL = 1000;
+const PROCESSING_MAX_ATTEMPTS = 8;
 
 function App() {
   const [operation, setOperation] = useState("entry");
@@ -21,8 +22,7 @@ function App() {
 
   const [sessions, setSessions] = useState([]);
   const [isLoadingSessions, setIsLoadingSessions] = useState(true);
-  const [isRefreshingSessions, setIsRefreshingSessions] =
-    useState(false);
+  const [isRefreshingSessions, setIsRefreshingSessions] = useState(false);
   const [lastUpdated, setLastUpdated] = useState(null);
 
   const [sessionFilter, setSessionFilter] = useState("ALL");
@@ -60,13 +60,9 @@ function App() {
 
       const newestSessionsFirst = [...receivedSessions].sort(
         (firstSession, secondSession) => {
-          const firstTime = new Date(
-            firstSession.entry_timestamp,
-          ).getTime();
+          const firstTime = new Date(firstSession.entry_timestamp).getTime();
 
-          const secondTime = new Date(
-            secondSession.entry_timestamp,
-          ).getTime();
+          const secondTime = new Date(secondSession.entry_timestamp).getTime();
 
           return secondTime - firstTime;
         },
@@ -84,14 +80,6 @@ function App() {
 
   useEffect(() => {
     fetchSessions(true);
-
-    const refreshTimer = window.setInterval(() => {
-      fetchSessions(false);
-    }, SESSION_REFRESH_INTERVAL);
-
-    return () => {
-      window.clearInterval(refreshTimer);
-    };
   }, [fetchSessions]);
 
   useEffect(() => {
@@ -168,11 +156,7 @@ function App() {
       return "Please select a licence-plate image.";
     }
 
-    const validImageTypes = [
-      "image/jpeg",
-      "image/jpg",
-      "image/png",
-    ];
+    const validImageTypes = ["image/jpeg", "image/jpg", "image/png"];
 
     if (!validImageTypes.includes(file.type)) {
       return "Please select a JPG, JPEG or PNG image.";
@@ -219,9 +203,7 @@ function App() {
         const parsedResponse = JSON.parse(responseText);
 
         return (
-          parsedResponse.message ??
-          parsedResponse.error ??
-          fallbackMessage
+          parsedResponse.message ?? parsedResponse.error ?? fallbackMessage
         );
       } catch {
         return responseText;
@@ -238,7 +220,7 @@ function App() {
       normalisedMessage.includes("active parking session") ||
       normalisedMessage.includes("already has an active")
     ) {
-      return "This vehicle already has an active parking session.";
+      return "This vehicle is already in the parking area. Please check the vehicle out before attempting another entry.";
     }
 
     if (
@@ -267,6 +249,30 @@ function App() {
     return message || "The request could not be completed.";
   }
 
+  function normaliseApiPayload(payload) {
+    let current = payload;
+
+    for (let depth = 0; depth < 4; depth += 1) {
+      if (typeof current === "string") {
+        try {
+          current = JSON.parse(current);
+          continue;
+        } catch {
+          return { message: current };
+        }
+      }
+
+      if (current && typeof current === "object" && "body" in current) {
+        current = current.body;
+        continue;
+      }
+
+      break;
+    }
+
+    return current && typeof current === "object" ? current : {};
+  }
+
   async function requestPresignedUploadUrl() {
     const response = await fetch(uploadUrlEndpoint, {
       method: "POST",
@@ -290,12 +296,30 @@ function App() {
       throw new Error(convertTechnicalErrorToUserMessage(apiError));
     }
 
-    const data = await response.json();
+    const rawData = await response.json();
+    const data = normaliseApiPayload(rawData);
 
-    const uploadUrl =
-      data.uploadUrl ??
-      data.presignedUrl ??
-      data.url;
+    const uploadUrl = data.uploadUrl ?? data.presignedUrl ?? data.url;
+
+    let imageKey =
+      data.imageKey ??
+      data.image_key ??
+      data.objectKey ??
+      data.object_key ??
+      data.s3Key ??
+      data.fileKey ??
+      data.key;
+
+    if (!imageKey && uploadUrl) {
+      try {
+        const uploadAddress = new URL(uploadUrl);
+        imageKey = decodeURIComponent(
+          uploadAddress.pathname.replace(/^\/+/, ""),
+        );
+      } catch {
+        imageKey = "";
+      }
+    }
 
     if (!uploadUrl) {
       throw new Error(
@@ -303,7 +327,16 @@ function App() {
       );
     }
 
-    return uploadUrl;
+    if (!imageKey) {
+      throw new Error(
+        "The image upload service did not return an image reference.",
+      );
+    }
+
+    return {
+      uploadUrl,
+      imageKey,
+    };
   }
 
   async function uploadImageToS3(uploadUrl) {
@@ -316,10 +349,92 @@ function App() {
     });
 
     if (!response.ok) {
-      throw new Error(
-        "The image could not be uploaded. Please try again.",
-      );
+      throw new Error("The image could not be uploaded. Please try again.");
     }
+  }
+
+  function wait(milliseconds) {
+    return new Promise((resolve) => {
+      window.setTimeout(resolve, milliseconds);
+    });
+  }
+
+  async function getProcessingStatus(imageKey) {
+    const requestUrl = `${processingStatusEndpoint}?imageKey=${encodeURIComponent(imageKey)}`;
+
+    const response = await fetch(requestUrl, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      const apiError = await readApiError(
+        response,
+        "The system could not check the parking result.",
+      );
+
+      throw new Error(convertTechnicalErrorToUserMessage(apiError));
+    }
+
+    const rawResult = await response.json();
+    const result = normaliseApiPayload(rawResult);
+
+    return {
+      ...result,
+      processingStatus:
+        result.processingStatus ??
+        result.processing_status ??
+        result.status ??
+        "PENDING",
+      message:
+        result.message ?? result.userMessage ?? result.user_message ?? "",
+    };
+  }
+
+  async function waitForProcessingResult(imageKey) {
+    let lastResult = null;
+
+    for (let attempt = 1; attempt <= PROCESSING_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        const result = await getProcessingStatus(imageKey);
+        lastResult = result;
+
+        const status = String(
+          result.processingStatus ?? "PENDING",
+        ).toUpperCase();
+
+        if (status === "SUCCESS" || status === "REJECTED") {
+          return { ...result, processingStatus: status };
+        }
+
+        /*
+         * A duplicate S3 delivery can occasionally expose a FAILED result
+         * after the parking operation has already succeeded. Do not show that
+         * immediately as a red error. Refresh the sessions first.
+         */
+        if (status === "FAILED") {
+          return {
+            ...result,
+            processingStatus: "UNCONFIRMED",
+          };
+        }
+      } catch (error) {
+        console.warn(`Processing-status check ${attempt} failed:`, error);
+      }
+
+      if (attempt < PROCESSING_MAX_ATTEMPTS) {
+        await wait(PROCESSING_POLL_INTERVAL);
+      }
+    }
+
+    return {
+      ...(lastResult ?? {}),
+      processingStatus: "UNCONFIRMED",
+      message:
+        "The image was uploaded and the parking sessions have been refreshed.",
+    };
   }
 
   async function handleUpload(event) {
@@ -342,27 +457,40 @@ function App() {
     setIsUploading(true);
 
     try {
-      const uploadUrl = await requestPresignedUploadUrl();
+      const { uploadUrl, imageKey } = await requestPresignedUploadUrl();
 
       await uploadImageToS3(uploadUrl);
-
       clearSelectedImage();
 
+      const processingResult = await waitForProcessingResult(imageKey);
+
+      await fetchSessions(false);
+
+      const resultMessage =
+        processingResult.message ?? "The parking operation has been completed.";
+
+      if (processingResult.processingStatus === "REJECTED") {
+        setSuccessMessage("");
+        setErrorMessage(convertTechnicalErrorToUserMessage(resultMessage));
+        return;
+      }
+
+      setErrorMessage("");
+
+      if (processingResult.processingStatus === "SUCCESS") {
+        setSuccessMessage(resultMessage);
+        return;
+      }
+
+      /*
+       * The upload succeeded, but the final status was delayed or a duplicate
+       * backend event reported FAILED after the database had already updated.
+       * Do not display a false red error. The refreshed sessions table is the
+       * source of truth for the completed parking operation.
+       */
       setSuccessMessage(
-        operation === "entry"
-          ? "Image uploaded successfully. The vehicle entry is now being processed."
-          : "Image uploaded successfully. The vehicle exit is now being processed.",
+        "The image was processed and the parking sessions have been refreshed.",
       );
-
-      window.setTimeout(async () => {
-        await fetchSessions(false);
-
-        setSuccessMessage(
-          operation === "entry"
-            ? "The vehicle entry has been processed. Check the parking sessions below."
-            : "The vehicle exit has been processed. The fee and receipt are now available below.",
-        );
-      }, PROCESSING_REFRESH_DELAY);
     } catch (error) {
       console.error("Image upload failed:", error);
 
@@ -371,9 +499,8 @@ function App() {
           ? error.message
           : "The image could not be uploaded.";
 
-      setErrorMessage(
-        convertTechnicalErrorToUserMessage(rawMessage),
-      );
+      setSuccessMessage("");
+      setErrorMessage(convertTechnicalErrorToUserMessage(rawMessage));
     } finally {
       setIsUploading(false);
     }
@@ -486,8 +613,7 @@ function App() {
   }
 
   function buildReceiptHtml(session) {
-    const receiptNumber =
-      session.receipt_number ?? "Parking receipt";
+    const receiptNumber = session.receipt_number ?? "Parking receipt";
 
     return `
       <!DOCTYPE html>
@@ -695,11 +821,7 @@ function App() {
   }
 
   function printReceipt(session) {
-    const receiptWindow = window.open(
-      "",
-      "_blank",
-      "width=800,height=900",
-    );
+    const receiptWindow = window.open("", "_blank", "width=800,height=900");
 
     if (!receiptWindow) {
       setErrorMessage(
@@ -753,15 +875,13 @@ function App() {
     <div className="app-shell">
       <header className="topbar">
         <div>
-          <p className="eyebrow">
-            NB Ticketless Parking System
-          </p>
+          <p className="eyebrow">NB Ticketless Parking System</p>
 
           <h1>Vehicle Parking Dashboard</h1>
 
           <p className="header-description">
-            Upload vehicle licence plates and monitor parking sessions
-            in real time.
+            Upload vehicle licence plates and monitor parking sessions in real
+            time.
           </p>
         </div>
 
@@ -772,10 +892,7 @@ function App() {
       </header>
 
       <main className="dashboard">
-        <section
-          className="summary-grid"
-          aria-label="Parking summary"
-        >
+        <section className="summary-grid" aria-label="Parking summary">
           <button
             type="button"
             className={
@@ -811,9 +928,7 @@ function App() {
                 ? "summary-card summary-card-button selected"
                 : "summary-card summary-card-button"
             }
-            onClick={() =>
-              handleSummaryCardClick("COMPLETED")
-            }
+            onClick={() => handleSummaryCardClick("COMPLETED")}
           >
             <span>Completed sessions</span>
             <strong>{completedSessions}</strong>
@@ -839,9 +954,7 @@ function App() {
           <article className="panel upload-panel">
             <div className="panel-heading">
               <div>
-                <p className="section-label">
-                  Vehicle check-in and exit
-                </p>
+                <p className="section-label">Vehicle check-in and exit</p>
 
                 <h2>Upload a licence-plate image</h2>
               </div>
@@ -855,9 +968,7 @@ function App() {
                     ? "operation-button active"
                     : "operation-button"
                 }
-                onClick={() =>
-                  handleOperationChange("entry")
-                }
+                onClick={() => handleOperationChange("entry")}
                 disabled={isUploading}
               >
                 Vehicle entry
@@ -870,9 +981,7 @@ function App() {
                     ? "operation-button active"
                     : "operation-button"
                 }
-                onClick={() =>
-                  handleOperationChange("exit")
-                }
+                onClick={() => handleOperationChange("exit")}
                 disabled={isUploading}
               >
                 Vehicle exit
@@ -897,11 +1006,7 @@ function App() {
                 ) : (
                   <div className="upload-placeholder">
                     <span className="upload-icon">
-                      {isUploading ? (
-                        <span className="button-spinner" />
-                      ) : (
-                        "↑"
-                      )}
+                      {isUploading ? <span className="button-spinner" /> : "↑"}
                     </span>
 
                     <strong>
@@ -910,9 +1015,7 @@ function App() {
                         : "Select a licence-plate image"}
                     </strong>
 
-                    <small>
-                      JPG, JPEG or PNG — maximum size 5 MB
-                    </small>
+                    <small>JPG, JPEG or PNG — maximum size 5 MB</small>
                   </div>
                 )}
 
@@ -932,9 +1035,7 @@ function App() {
                   <div>
                     <strong>{selectedImage.name}</strong>
 
-                    <small>
-                      {(selectedImage.size / 1024).toFixed(1)} KB
-                    </small>
+                    <small>{(selectedImage.size / 1024).toFixed(1)} KB</small>
                   </div>
 
                   <button
@@ -949,19 +1050,13 @@ function App() {
               )}
 
               {errorMessage && (
-                <div
-                  className="message error-message"
-                  role="alert"
-                >
+                <div className="message error-message" role="alert">
                   {errorMessage}
                 </div>
               )}
 
               {successMessage && (
-                <div
-                  className="message success-message"
-                  role="status"
-                >
+                <div className="message success-message" role="status">
                   {successMessage}
                 </div>
               )}
@@ -971,9 +1066,7 @@ function App() {
                 className="primary-button"
                 disabled={!selectedImage || isUploading}
               >
-                {isUploading && (
-                  <span className="button-spinner" />
-                )}
+                {isUploading && <span className="button-spinner" />}
 
                 {isUploading
                   ? "Processing image..."
@@ -997,10 +1090,7 @@ function App() {
               <div className="process-item">
                 <span>1</span>
 
-                <p>
-                  Upload a clear photo of the vehicle&apos;s licence
-                  plate.
-                </p>
+                <p>Upload a clear photo of the vehicle&apos;s licence plate.</p>
               </div>
 
               <div className="process-item">
@@ -1026,23 +1116,16 @@ function App() {
           </article>
         </section>
 
-        <section
-          ref={sessionsSectionRef}
-          className="panel sessions-panel"
-        >
+        <section ref={sessionsSectionRef} className="panel sessions-panel">
           <div className="panel-heading sessions-heading">
             <div>
-              <p className="section-label">
-                Vehicle activity
-              </p>
+              <p className="section-label">Vehicle activity</p>
 
               <h2>{getSessionsHeading()}</h2>
 
               <p className="last-updated">
                 {lastUpdated
-                  ? `Last updated at ${lastUpdated.toLocaleTimeString(
-                      "en-ZA",
-                    )}`
+                  ? `Last updated at ${lastUpdated.toLocaleTimeString("en-ZA")}`
                   : "Waiting for parking session information"}
               </p>
             </div>
@@ -1051,27 +1134,11 @@ function App() {
               type="button"
               className="refresh-button"
               onClick={() => fetchSessions(true)}
-              disabled={
-                isLoadingSessions || isRefreshingSessions
-              }
+              disabled={isLoadingSessions || isRefreshingSessions}
             >
-              {(isLoadingSessions ||
-                isRefreshingSessions) && (
-                <span className="small-spinner" />
-              )}
-
-              {isLoadingSessions || isRefreshingSessions
-                ? "Refreshing..."
-                : "Refresh sessions"}
+              Refresh sessions
             </button>
           </div>
-
-          {isRefreshingSessions &&
-            sessions.length > 0 && (
-              <div className="refresh-notice">
-                Updating parking information…
-              </div>
-            )}
 
           {isLoadingSessions && sessions.length === 0 ? (
             <div className="empty-state">
@@ -1123,29 +1190,19 @@ function App() {
 
                       <td>
                         <span
-                          className={getStatusClass(
-                            session.session_status,
-                          )}
+                          className={getStatusClass(session.session_status)}
                         >
                           <span className="status-dot" />
 
-                          {getStatusLabel(
-                            session.session_status,
-                          )}
+                          {getStatusLabel(session.session_status)}
                         </span>
                       </td>
 
-                      <td>
-                        {formatDateTime(
-                          session.entry_timestamp,
-                        )}
-                      </td>
+                      <td>{formatDateTime(session.entry_timestamp)}</td>
 
                       <td>
                         {session.exit_timestamp
-                          ? formatDateTime(
-                              session.exit_timestamp,
-                            )
+                          ? formatDateTime(session.exit_timestamp)
                           : "Not exited"}
                       </td>
 
@@ -1160,9 +1217,7 @@ function App() {
                       <td>
                         {session.session_status === "ACTIVE"
                           ? "Calculating…"
-                          : formatCurrency(
-                              session.calculated_fee,
-                            )}
+                          : formatCurrency(session.calculated_fee)}
                       </td>
 
                       <td>
@@ -1170,9 +1225,7 @@ function App() {
                           <button
                             type="button"
                             className="receipt-link-button"
-                            onClick={() =>
-                              setSelectedReceipt(session)
-                            }
+                            onClick={() => setSelectedReceipt(session)}
                           >
                             Open receipt
                           </button>
@@ -1211,9 +1264,7 @@ function App() {
               <div>
                 <p>NB Ticketless Parking System</p>
 
-                <h2 id="receipt-title">
-                  Parking Receipt
-                </h2>
+                <h2 id="receipt-title">Parking Receipt</h2>
               </div>
 
               <button
@@ -1227,33 +1278,25 @@ function App() {
             </header>
 
             <div className="receipt-body">
-              <div className="receipt-paid-badge">
-                Payment completed
-              </div>
+              <div className="receipt-paid-badge">Payment completed</div>
 
               <div className="receipt-row">
                 <span>Receipt number</span>
 
-                <strong>
-                  {selectedReceipt.receipt_number}
-                </strong>
+                <strong>{selectedReceipt.receipt_number}</strong>
               </div>
 
               <div className="receipt-row">
                 <span>Licence plate</span>
 
-                <strong>
-                  {selectedReceipt.license_plate}
-                </strong>
+                <strong>{selectedReceipt.license_plate}</strong>
               </div>
 
               <div className="receipt-row">
                 <span>Entry date and time</span>
 
                 <strong>
-                  {formatDateTime(
-                    selectedReceipt.entry_timestamp,
-                  )}
+                  {formatDateTime(selectedReceipt.entry_timestamp)}
                 </strong>
               </div>
 
@@ -1261,28 +1304,20 @@ function App() {
                 <span>Exit date and time</span>
 
                 <strong>
-                  {formatDateTime(
-                    selectedReceipt.exit_timestamp,
-                  )}
+                  {formatDateTime(selectedReceipt.exit_timestamp)}
                 </strong>
               </div>
 
               <div className="receipt-row">
                 <span>Parking duration</span>
 
-                <strong>
-                  {selectedReceipt.duration_minutes ?? 0} minutes
-                </strong>
+                <strong>{selectedReceipt.duration_minutes ?? 0} minutes</strong>
               </div>
 
               <div className="receipt-row">
                 <span>Hourly rate</span>
 
-                <strong>
-                  {formatCurrency(
-                    selectedReceipt.hourly_rate,
-                  )}
-                </strong>
+                <strong>{formatCurrency(selectedReceipt.hourly_rate)}</strong>
               </div>
 
               <div className="receipt-row">
@@ -1295,9 +1330,7 @@ function App() {
                 <span>Total parking fee</span>
 
                 <strong>
-                  {formatCurrency(
-                    selectedReceipt.calculated_fee,
-                  )}
+                  {formatCurrency(selectedReceipt.calculated_fee)}
                 </strong>
               </div>
             </div>
@@ -1314,9 +1347,7 @@ function App() {
               <button
                 type="button"
                 className="secondary-button"
-                onClick={() =>
-                  printReceipt(selectedReceipt)
-                }
+                onClick={() => printReceipt(selectedReceipt)}
               >
                 Print or save as PDF
               </button>
@@ -1324,9 +1355,7 @@ function App() {
               <button
                 type="button"
                 className="primary-action-button"
-                onClick={() =>
-                  downloadReceipt(selectedReceipt)
-                }
+                onClick={() => downloadReceipt(selectedReceipt)}
               >
                 Download receipt
               </button>

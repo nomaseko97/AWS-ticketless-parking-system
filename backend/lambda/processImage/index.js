@@ -42,6 +42,20 @@ function normalisePlateText(text = "") {
   return text.toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
+const OCR_NOISE_WORDS = new Set([
+  "ZA",
+  "RSA",
+  "SANS",
+  "GAUTENG",
+  "REPUBLIC",
+  "SOUTHAFRICA",
+  "AFRICA",
+  "DIPLOMATIC",
+  "MOTOR",
+]);
+
+const OCR_NOISE_PARTS = ["SANS", "GAUTENG", "SOUTHAFRICA", "REPUBLIC"];
+
 function getBox(detection) {
   const box = detection?.Geometry?.BoundingBox;
 
@@ -61,8 +75,57 @@ function getBox(detection) {
     height,
     right: left + width,
     bottom: top + height,
+    centreX: left + width / 2,
     centreY: top + height / 2,
   };
+}
+
+function isKnownNoise(text = "") {
+  const normalisedText = normalisePlateText(text);
+
+  if (!normalisedText) {
+    return true;
+  }
+
+  if (OCR_NOISE_WORDS.has(normalisedText)) {
+    return true;
+  }
+
+  return OCR_NOISE_PARTS.some((noisePart) =>
+    normalisedText.includes(noisePart),
+  );
+}
+
+function isUsefulDetection(detection, maximumHeight) {
+  const text = normalisePlateText(detection?.DetectedText);
+  const box = getBox(detection);
+  const confidence = detection?.Confidence ?? 0;
+
+  if (!text || !box || confidence < 25) {
+    return false;
+  }
+
+  if (isKnownNoise(text)) {
+    return false;
+  }
+
+  /*
+   * Tiny text near the lower edge is normally the SANS/manufacturer
+   * marking printed beneath the registration number.
+   */
+  if (
+    maximumHeight > 0 &&
+    box.height < maximumHeight * 0.34 &&
+    box.centreY > 0.58
+  ) {
+    return false;
+  }
+
+  if (box.height < 0.018 || box.width < 0.018) {
+    return false;
+  }
+
+  return true;
 }
 
 function areOnSameRow(firstDetection, secondDetection) {
@@ -74,20 +137,17 @@ function areOnSameRow(firstDetection, secondDetection) {
   }
 
   const overlapTop = Math.max(firstBox.top, secondBox.top);
-
   const overlapBottom = Math.min(firstBox.bottom, secondBox.bottom);
-
   const verticalOverlap = Math.max(0, overlapBottom - overlapTop);
-
   const smallerHeight = Math.min(firstBox.height, secondBox.height);
-
   const overlapRatio = smallerHeight > 0 ? verticalOverlap / smallerHeight : 0;
-
   const centreDifference = Math.abs(firstBox.centreY - secondBox.centreY);
+  const centreTolerance = Math.max(
+    0.045,
+    Math.max(firstBox.height, secondBox.height) * 0.62,
+  );
 
-  const centreTolerance = Math.max(0.08, smallerHeight * 1.5);
-
-  return overlapRatio >= 0.1 || centreDifference <= centreTolerance;
+  return overlapRatio >= 0.25 || centreDifference <= centreTolerance;
 }
 
 function horizontalGap(firstDetection, secondDetection) {
@@ -99,7 +159,6 @@ function horizontalGap(firstDetection, secondDetection) {
   }
 
   const leftBox = firstBox.left <= secondBox.left ? firstBox : secondBox;
-
   const rightBox = firstBox.left <= secondBox.left ? secondBox : firstBox;
 
   return Math.max(0, rightBox.left - leftBox.right);
@@ -114,24 +173,16 @@ function horizontalOverlapRatio(firstDetection, secondDetection) {
   }
 
   const overlapLeft = Math.max(firstBox.left, secondBox.left);
-
   const overlapRight = Math.min(firstBox.right, secondBox.right);
-
   const overlapWidth = Math.max(0, overlapRight - overlapLeft);
-
   const smallerWidth = Math.min(firstBox.width, secondBox.width);
 
-  if (smallerWidth <= 0) {
-    return 0;
-  }
-
-  return overlapWidth / smallerWidth;
+  return smallerWidth > 0 ? overlapWidth / smallerWidth : 0;
 }
 
 function sortLeftToRight(detections) {
   return [...detections].sort((firstDetection, secondDetection) => {
     const firstLeft = getBox(firstDetection)?.left ?? 0;
-
     const secondLeft = getBox(secondDetection)?.left ?? 0;
 
     return firstLeft - secondLeft;
@@ -140,7 +191,6 @@ function sortLeftToRight(detections) {
 
 function calculateAverageCharacterWidth(detection) {
   const box = getBox(detection);
-
   const text = normalisePlateText(detection?.DetectedText);
 
   if (!box || text.length === 0) {
@@ -155,14 +205,6 @@ function shouldRemoveTextOverlap(
   currentDetection,
   overlapLength,
 ) {
-  /*
-   * If the Rekognition boxes overlap physically, the
-   * repeated boundary character probably represents the
-   * same character detected twice.
-   *
-   * Example:
-   * 9JR + RI205 becomes 9JRI205.
-   */
   const physicalOverlap = horizontalOverlapRatio(
     previousDetection,
     currentDetection,
@@ -172,21 +214,9 @@ function shouldRemoveTextOverlap(
     return true;
   }
 
-  /*
-   * If the boxes do not overlap, only remove the repeated
-   * character when the two text boxes are extremely close.
-   *
-   * This preserves both G characters in:
-   * JC12CG + GP = JC12CGGP
-   *
-   * The Gauteng emblem creates a larger physical gap between
-   * the first G and the second G.
-   */
   const gap = horizontalGap(previousDetection, currentDetection);
-
   const previousCharacterWidth =
     calculateAverageCharacterWidth(previousDetection);
-
   const currentCharacterWidth =
     calculateAverageCharacterWidth(currentDetection);
 
@@ -200,10 +230,9 @@ function shouldRemoveTextOverlap(
   }
 
   const smallerCharacterWidth = Math.min(...availableCharacterWidths);
-
   const allowedGap = Math.max(
     0.003,
-    smallerCharacterWidth * 0.4 * overlapLength,
+    smallerCharacterWidth * 0.5 * overlapLength,
   );
 
   return gap <= allowedGap;
@@ -215,7 +244,6 @@ function mergeDetectedSegments(
   currentDetection,
 ) {
   const leftText = normalisePlateText(currentText);
-
   const rightText = normalisePlateText(currentDetection?.DetectedText);
 
   if (!leftText) {
@@ -234,7 +262,6 @@ function mergeDetectedSegments(
     overlapLength -= 1
   ) {
     const leftEnding = leftText.slice(-overlapLength);
-
     const rightBeginning = rightText.slice(0, overlapLength);
 
     if (leftEnding !== rightBeginning) {
@@ -255,7 +282,46 @@ function mergeDetectedSegments(
   return leftText + rightText;
 }
 
-function createCandidate(detections, merged) {
+function countCharacterTransitions(text) {
+  let transitions = 0;
+
+  for (let index = 1; index < text.length; index += 1) {
+    const previousIsLetter = /[A-Z]/.test(text[index - 1]);
+    const currentIsLetter = /[A-Z]/.test(text[index]);
+
+    if (previousIsLetter !== currentIsLetter) {
+      transitions += 1;
+    }
+  }
+
+  return transitions;
+}
+
+function calculateCandidateBounds(detections) {
+  const boxes = detections.map(getBox).filter(Boolean);
+
+  if (boxes.length === 0) {
+    return null;
+  }
+
+  const left = Math.min(...boxes.map((box) => box.left));
+  const right = Math.max(...boxes.map((box) => box.right));
+  const top = Math.min(...boxes.map((box) => box.top));
+  const bottom = Math.max(...boxes.map((box) => box.bottom));
+
+  return {
+    left,
+    right,
+    top,
+    bottom,
+    width: right - left,
+    height: bottom - top,
+    centreX: (left + right) / 2,
+    centreY: (top + bottom) / 2,
+  };
+}
+
+function createCandidate(detections, merged, sourceType) {
   const sortedDetections = sortLeftToRight(detections);
 
   const normalisedText = sortedDetections.reduce(
@@ -273,142 +339,373 @@ function createCandidate(detections, merged) {
     "",
   );
 
-  const containsLetter = /[A-Z]/.test(normalisedText);
+  if (
+    !normalisedText ||
+    isKnownNoise(normalisedText) ||
+    OCR_NOISE_PARTS.some((part) => normalisedText.includes(part))
+  ) {
+    return null;
+  }
 
+  const containsLetter = /[A-Z]/.test(normalisedText);
   const containsNumber = /[0-9]/.test(normalisedText);
 
-  if (!containsNumber) {
+  if (!containsLetter || !containsNumber) {
     return null;
   }
 
-  if (normalisedText.length < 4 || normalisedText.length > 12) {
+  if (normalisedText.length < 5 || normalisedText.length > 10) {
     return null;
   }
 
-  const totalConfidence = sortedDetections.reduce((total, detection) => {
-    return total + (detection.Confidence ?? 0);
-  }, 0);
+  const totalConfidence = sortedDetections.reduce(
+    (total, detection) => total + (detection.Confidence ?? 0),
+    0,
+  );
 
   const confidence = totalConfidence / sortedDetections.length;
+  const bounds = calculateCandidateBounds(sortedDetections);
+  const transitions = countCharacterTransitions(normalisedText);
 
   let score = confidence;
 
-  if (containsLetter && containsNumber) {
-    score += 45;
+  if (normalisedText.length >= 6 && normalisedText.length <= 9) {
+    score += 58;
+  } else {
+    score += 24;
   }
 
-  if (normalisedText.length >= 5 && normalisedText.length <= 9) {
-    score += 45;
-  } else {
-    score += 20;
+  if (transitions >= 1 && transitions <= 3) {
+    score += 30;
+  } else if (transitions > 4) {
+    score -= 25;
+  }
+
+  if (/^[A-Z]{1,4}[0-9]{1,4}[A-Z]{0,3}$/.test(normalisedText)) {
+    score += 55;
+  }
+
+  /*
+   * Reward a complete South African-style plate that includes a trailing
+   * province/suffix letter. This helps BPG355B outrank the incomplete
+   * BPG355 candidate when both are detected.
+   */
+  if (/^[A-Z]{2,4}[0-9]{2,4}[A-Z]{1,3}$/.test(normalisedText)) {
+    score += 28;
+  }
+
+  if (/^[0-9]{1,4}[A-Z]{1,4}[0-9A-Z]{0,3}$/.test(normalisedText)) {
+    score += 18;
   }
 
   if (merged) {
-    score += 60;
+    score += 38;
   }
 
-  const boxes = sortedDetections.map(getBox).filter(Boolean);
+  if (sourceType === "LINE") {
+    score += 12;
+  }
 
-  if (boxes.length > 0) {
-    const left = Math.min(...boxes.map((box) => box.left));
+  if (bounds) {
+    score += Math.min(bounds.width * 95, 70);
+    score += Math.min(bounds.height * 260, 55);
 
-    const right = Math.max(...boxes.map((box) => box.right));
+    if (bounds.centreX >= 0.2 && bounds.centreX <= 0.8) {
+      score += 12;
+    }
 
-    const top = Math.min(...boxes.map((box) => box.top));
+    if (bounds.centreY >= 0.18 && bounds.centreY <= 0.78) {
+      score += 10;
+    }
 
-    const bottom = Math.max(...boxes.map((box) => box.bottom));
+    if (bounds.centreY > 0.82) {
+      score -= 45;
+    }
+  }
 
-    const combinedWidth = right - left;
-
-    const combinedHeight = bottom - top;
-
-    score += Math.min(combinedWidth * 70, 40);
-
-    score += Math.min(combinedHeight * 250, 45);
+  if (/^[A-Z]{0,1}[0-9]{3,}/.test(normalisedText)) {
+    score -= 18;
   }
 
   return {
     originalText: sortedDetections
       .map((detection) => detection.DetectedText)
       .join(" + "),
-
     normalisedText,
-
     confidence: Number(confidence.toFixed(2)),
-
     score: Number(score.toFixed(2)),
-
     merged,
-
+    sourceType,
     detectionCount: sortedDetections.length,
+    bounds,
   };
 }
 
-function selectPlateCandidate(textDetections = []) {
-  const lineDetections = textDetections.filter((detection) => {
-    return (
-      detection.Type === "LINE" &&
-      Boolean(normalisePlateText(detection.DetectedText)) &&
-      (detection.Confidence ?? 0) >= 20 &&
-      Boolean(getBox(detection))
-    );
-  });
+function detectionsCanBeJoined(firstDetection, secondDetection) {
+  if (!areOnSameRow(firstDetection, secondDetection)) {
+    return false;
+  }
 
-  const candidates = [];
+  const gap = horizontalGap(firstDetection, secondDetection);
+  const firstCharacterWidth = calculateAverageCharacterWidth(firstDetection);
+  const secondCharacterWidth = calculateAverageCharacterWidth(secondDetection);
+
+  const usableCharacterWidths = [
+    firstCharacterWidth,
+    secondCharacterWidth,
+  ].filter((width) => width > 0);
+
+  const characterWidth =
+    usableCharacterWidths.length > 0
+      ? Math.max(...usableCharacterWidths)
+      : 0.05;
+
+  const firstText = normalisePlateText(firstDetection?.DetectedText);
+  const secondText = normalisePlateText(secondDetection?.DetectedText);
+  const firstBox = getBox(firstDetection);
+  const secondBox = getBox(secondDetection);
 
   /*
-   * First, create candidates from each individual
-   * Rekognition LINE detection.
+   * Gauteng plates can place the provincial crest between the main number
+   * and a final one- or two-letter suffix. For example, Rekognition may
+   * return BPG355 and B as separate detections with a large physical gap.
+   * Allow that suffix when both detections are large and aligned.
    */
-  for (const detection of lineDetections) {
-    const candidate = createCandidate([detection], false);
+  const secondLooksLikeProvinceSuffix = /^[A-Z]{1,2}$/.test(secondText);
+  const firstLooksLikeMainPlate =
+    /^[A-Z]{1,4}[0-9]{1,4}[A-Z]{0,2}$/.test(firstText) &&
+    /[0-9]/.test(firstText);
+
+  const similarHeight =
+    firstBox &&
+    secondBox &&
+    Math.min(firstBox.height, secondBox.height) /
+      Math.max(firstBox.height, secondBox.height) >=
+      0.55;
+
+  if (
+    firstLooksLikeMainPlate &&
+    secondLooksLikeProvinceSuffix &&
+    similarHeight &&
+    gap <= 0.34
+  ) {
+    return true;
+  }
+
+  /*
+   * Normal allowance for neighbouring OCR segments. It is intentionally
+   * wider than ordinary text because a crest may split a licence plate.
+   */
+  return gap <= Math.max(0.2, characterWidth * 6.5);
+}
+
+function buildRowGroups(detections) {
+  const sortedByHeight = [...detections].sort((first, second) => {
+    return (getBox(second)?.height ?? 0) - (getBox(first)?.height ?? 0);
+  });
+
+  const rows = [];
+
+  for (const detection of sortedByHeight) {
+    const matchingRow = rows.find((row) =>
+      row.some((existingDetection) =>
+        areOnSameRow(existingDetection, detection),
+      ),
+    );
+
+    if (matchingRow) {
+      matchingRow.push(detection);
+    } else {
+      rows.push([detection]);
+    }
+  }
+
+  return rows.map(sortLeftToRight);
+}
+
+function addCandidatesFromDetectionPool(detections, sourceType, candidates) {
+  if (detections.length === 0) {
+    return;
+  }
+
+  const maximumHeight = Math.max(
+    ...detections.map((detection) => getBox(detection)?.height ?? 0),
+  );
+
+  const usefulDetections = detections.filter((detection) =>
+    isUsefulDetection(detection, maximumHeight),
+  );
+
+  for (const detection of usefulDetections) {
+    const candidate = createCandidate([detection], false, sourceType);
 
     if (candidate) {
       candidates.push(candidate);
     }
   }
 
-  /*
-   * Next, combine LINE detections that appear next to
-   * each other on the same row.
-   */
-  for (
-    let firstIndex = 0;
-    firstIndex < lineDetections.length;
-    firstIndex += 1
-  ) {
-    for (
-      let secondIndex = firstIndex + 1;
-      secondIndex < lineDetections.length;
-      secondIndex += 1
-    ) {
-      const firstDetection = lineDetections[firstIndex];
+  const rows = buildRowGroups(usefulDetections);
 
-      const secondDetection = lineDetections[secondIndex];
+  for (const row of rows) {
+    /*
+     * Build all contiguous combinations of up to four segments. This handles
+     * Rekognition returning HDJ, 392 and GP as separate detections, while
+     * avoiding unrelated text elsewhere in the image.
+     */
+    for (let startIndex = 0; startIndex < row.length; startIndex += 1) {
+      const combination = [row[startIndex]];
 
-      if (!areOnSameRow(firstDetection, secondDetection)) {
-        continue;
-      }
+      for (
+        let nextIndex = startIndex + 1;
+        nextIndex < row.length && combination.length < 4;
+        nextIndex += 1
+      ) {
+        const previousDetection = combination[combination.length - 1];
+        const nextDetection = row[nextIndex];
 
-      if (horizontalGap(firstDetection, secondDetection) > 0.45) {
-        continue;
-      }
+        if (!detectionsCanBeJoined(previousDetection, nextDetection)) {
+          break;
+        }
 
-      const candidate = createCandidate(
-        [firstDetection, secondDetection],
-        true,
-      );
+        combination.push(nextDetection);
 
-      if (candidate) {
-        candidates.push(candidate);
+        const candidate = createCandidate(combination, true, sourceType);
+
+        if (candidate) {
+          candidates.push(candidate);
+        }
       }
     }
   }
+}
 
-  /*
-   * Remove duplicate candidate values, keeping the
-   * highest-scoring version.
-   */
+function appendRightSideProvinceSuffix(candidate, detections) {
+  if (!candidate?.bounds) {
+    return candidate;
+  }
+
+  const currentText = candidate.normalisedText;
+
+  if (!/^[A-Z]{1,4}[0-9]{2,4}[A-Z]{0,2}$/.test(currentText)) {
+    return candidate;
+  }
+
+  const suffixDetections = detections
+    .filter((detection) => {
+      const text = normalisePlateText(detection?.DetectedText);
+      const box = getBox(detection);
+
+      if (!box || !/^[A-Z]{1,2}$/.test(text)) {
+        return false;
+      }
+
+      if (isKnownNoise(text) || (detection.Confidence ?? 0) < 20) {
+        return false;
+      }
+
+      const isToRight = box.left >= candidate.bounds.right - 0.015;
+      const centreDifference = Math.abs(box.centreY - candidate.bounds.centreY);
+      const rowTolerance = Math.max(
+        0.08,
+        Math.max(box.height, candidate.bounds.height) * 0.72,
+      );
+      const similarHeight =
+        Math.min(box.height, candidate.bounds.height) /
+          Math.max(box.height, candidate.bounds.height) >=
+        0.38;
+      const gap = Math.max(0, box.left - candidate.bounds.right);
+
+      return (
+        isToRight &&
+        centreDifference <= rowTolerance &&
+        similarHeight &&
+        gap <= 0.42
+      );
+    })
+    .sort((first, second) => {
+      const firstBox = getBox(first);
+      const secondBox = getBox(second);
+
+      const firstGap = Math.max(0, firstBox.left - candidate.bounds.right);
+      const secondGap = Math.max(0, secondBox.left - candidate.bounds.right);
+
+      if (Math.abs(firstGap - secondGap) > 0.01) {
+        return firstGap - secondGap;
+      }
+
+      return (second.Confidence ?? 0) - (first.Confidence ?? 0);
+    });
+
+  const suffixDetection = suffixDetections[0];
+
+  if (!suffixDetection) {
+    return candidate;
+  }
+
+  const suffix = normalisePlateText(suffixDetection.DetectedText);
+
+  if (!suffix || currentText.endsWith(suffix)) {
+    return candidate;
+  }
+
+  const combinedText = `${currentText}${suffix}`;
+
+  if (combinedText.length > 10) {
+    return candidate;
+  }
+
+  const suffixBox = getBox(suffixDetection);
+  const combinedBounds = {
+    left: Math.min(candidate.bounds.left, suffixBox.left),
+    right: Math.max(candidate.bounds.right, suffixBox.right),
+    top: Math.min(candidate.bounds.top, suffixBox.top),
+    bottom: Math.max(candidate.bounds.bottom, suffixBox.bottom),
+  };
+
+  combinedBounds.width = combinedBounds.right - combinedBounds.left;
+  combinedBounds.height = combinedBounds.bottom - combinedBounds.top;
+  combinedBounds.centreX = (combinedBounds.left + combinedBounds.right) / 2;
+  combinedBounds.centreY = (combinedBounds.top + combinedBounds.bottom) / 2;
+
+  return {
+    ...candidate,
+    originalText: `${candidate.originalText} + ${suffixDetection.DetectedText}`,
+    normalisedText: combinedText,
+    confidence: Number(
+      (
+        (candidate.confidence * candidate.detectionCount +
+          (suffixDetection.Confidence ?? 0)) /
+        (candidate.detectionCount + 1)
+      ).toFixed(2),
+    ),
+    score: Number((candidate.score + 72).toFixed(2)),
+    merged: true,
+    detectionCount: candidate.detectionCount + 1,
+    bounds: combinedBounds,
+    suffixRecovered: true,
+  };
+}
+
+function selectPlateCandidate(textDetections = []) {
+  const lineDetections = textDetections.filter(
+    (detection) =>
+      detection.Type === "LINE" &&
+      Boolean(getBox(detection)) &&
+      Boolean(normalisePlateText(detection.DetectedText)),
+  );
+
+  const wordDetections = textDetections.filter(
+    (detection) =>
+      detection.Type === "WORD" &&
+      Boolean(getBox(detection)) &&
+      Boolean(normalisePlateText(detection.DetectedText)),
+  );
+
+  const candidates = [];
+
+  addCandidatesFromDetectionPool(lineDetections, "LINE", candidates);
+  addCandidatesFromDetectionPool(wordDetections, "WORD", candidates);
+
   const uniqueCandidates = new Map();
 
   for (const candidate of candidates) {
@@ -426,10 +723,33 @@ function selectPlateCandidate(textDetections = []) {
 
   console.log(
     "Top licence plate candidates:",
-    JSON.stringify(sortedCandidates.slice(0, 5), null, 2),
+    JSON.stringify(sortedCandidates.slice(0, 10), null, 2),
   );
 
-  return sortedCandidates[0] ?? null;
+  const initialBestCandidate = sortedCandidates[0] ?? null;
+
+  const allUsefulDetections = [...lineDetections, ...wordDetections];
+  const bestCandidate = appendRightSideProvinceSuffix(
+    initialBestCandidate,
+    allUsefulDetections,
+  );
+
+  if (bestCandidate?.suffixRecovered) {
+    console.log(
+      "Recovered right-side province suffix:",
+      JSON.stringify(bestCandidate, null, 2),
+    );
+  }
+
+  /*
+   * Do not create a parking session from a very weak or incomplete result.
+   * It is safer to ask for another image than to store the wrong vehicle.
+   */
+  if (!bestCandidate || bestCandidate.score < 145) {
+    return null;
+  }
+
+  return bestCandidate;
 }
 
 function decodeLambdaPayload(payload) {
@@ -466,19 +786,7 @@ function decodeResponseBody(body) {
   }
 }
 
-async function invokeDatabaseHandler({
-  operation,
-  plateNumber,
-  imageKey,
-  confidence,
-}) {
-  const databaseRequest = {
-    action: operation,
-    plateNumber,
-    imageKey,
-    confidence,
-  };
-
+async function invokeDatabaseAction(databaseRequest) {
   console.log("Sending request to database Lambda:", databaseRequest);
 
   const command = new InvokeCommand({
@@ -518,7 +826,23 @@ async function invokeDatabaseHandler({
     );
   }
 
-  if (statusCode >= 400) {
+  return result;
+}
+
+async function invokeParkingOperation({
+  operation,
+  plateNumber,
+  imageKey,
+  confidence,
+}) {
+  const result = await invokeDatabaseAction({
+    action: operation,
+    plateNumber,
+    imageKey,
+    confidence,
+  });
+
+  if (result.statusCode >= 400) {
     console.warn("Database request was rejected:", result);
 
     return {
@@ -533,6 +857,33 @@ async function invokeDatabaseHandler({
     saved: true,
     ...result,
   };
+}
+
+async function claimImageProcessing({ objectKey, operation }) {
+  return invokeDatabaseAction({
+    action: "claimProcessing",
+    imageKey: objectKey,
+    operation,
+  });
+}
+
+async function recordImageProcessingResult({
+  objectKey,
+  operation,
+  plateNumber = null,
+  processingStatus,
+  message,
+  httpStatus,
+}) {
+  return invokeDatabaseAction({
+    action: "recordProcessingResult",
+    imageKey: objectKey,
+    operation,
+    plateNumber,
+    processingStatus,
+    message,
+    httpStatus,
+  });
 }
 
 async function processS3Record(record) {
@@ -563,62 +914,132 @@ async function processS3Record(record) {
     };
   }
 
-  const detectTextCommand = new DetectTextCommand({
-    Image: {
-      S3Object: {
-        Bucket: bucketName,
-        Name: objectKey,
-      },
-    },
-  });
-
-  const rekognitionResponse = await rekognitionClient.send(detectTextCommand);
-
-  const textDetections = rekognitionResponse.TextDetections ?? [];
-
-  const detectedLines = textDetections
-    .filter((detection) => detection.Type === "LINE")
-    .map((detection) => ({
-      text: detection.DetectedText ?? "",
-
-      confidence: Number((detection.Confidence ?? 0).toFixed(2)),
-    }));
-
-  const plateCandidate = selectPlateCandidate(textDetections);
-
-  let databaseResult = {
-    saved: false,
-    reason: "No licence plate candidate was found.",
-  };
-
-  if (plateCandidate) {
-    databaseResult = await invokeDatabaseHandler({
-      operation,
-
-      plateNumber: plateCandidate.normalisedText,
-
-      imageKey: objectKey,
-
-      confidence: plateCandidate.confidence,
-    });
-  } else {
-    console.warn(
-      "No licence plate candidate was found. The image was not saved as a parking session.",
-    );
-  }
-
-  const result = {
-    bucketName,
+  /*
+   * Atomically claim this exact image key before running Rekognition.
+   * If S3 delivers the same event again, the second invocation sees the
+   * existing row and exits without repeating the parking operation.
+   */
+  const claimResult = await claimImageProcessing({
     objectKey,
     operation,
-    detectedLines,
-    plateCandidate,
-    databaseResult,
-  };
+  });
 
-  console.log("Complete processing result:", JSON.stringify(result, null, 2));
+  if (!claimResult.shouldProcess) {
+    console.log(
+      "Duplicate S3 event ignored. Existing processing result:",
+      JSON.stringify(claimResult.existingResult),
+    );
 
-  return result;
+    return {
+      bucketName,
+      objectKey,
+      operation,
+      duplicateEvent: true,
+      skipped: true,
+      existingResult: claimResult.existingResult,
+    };
+  }
+
+  try {
+    const detectTextCommand = new DetectTextCommand({
+      Image: {
+        S3Object: {
+          Bucket: bucketName,
+          Name: objectKey,
+        },
+      },
+    });
+
+    const rekognitionResponse = await rekognitionClient.send(detectTextCommand);
+
+    const textDetections = rekognitionResponse.TextDetections ?? [];
+
+    const detectedLines = textDetections
+      .filter((detection) => detection.Type === "LINE")
+      .map((detection) => ({
+        text: detection.DetectedText ?? "",
+
+        confidence: Number((detection.Confidence ?? 0).toFixed(2)),
+      }));
+
+    const plateCandidate = selectPlateCandidate(textDetections);
+
+    if (!plateCandidate) {
+      const message =
+        "The licence plate could not be read clearly. Please upload a clearer image.";
+
+      await recordImageProcessingResult({
+        objectKey,
+        operation,
+        processingStatus: "REJECTED",
+        message,
+        httpStatus: 422,
+      });
+
+      return {
+        bucketName,
+        objectKey,
+        operation,
+        detectedLines,
+        plateCandidate: null,
+        databaseResult: {
+          saved: false,
+          statusCode: 422,
+          processingStatus: "REJECTED",
+          message,
+        },
+      };
+    }
+
+    const databaseResult = await invokeParkingOperation({
+      operation,
+      plateNumber: plateCandidate.normalisedText,
+      imageKey: objectKey,
+      confidence: plateCandidate.confidence,
+    });
+
+    const result = {
+      bucketName,
+      objectKey,
+      operation,
+      detectedLines,
+      plateCandidate,
+      databaseResult,
+    };
+
+    console.log("Complete processing result:", JSON.stringify(result, null, 2));
+
+    return result;
+  } catch (error) {
+    console.error("S3 record processing failed:", {
+      objectKey,
+      operation,
+      message: error.message,
+      stack: error.stack,
+    });
+
+    /*
+     * This cannot downgrade an existing SUCCESS result because the database
+     * handler now preserves SUCCESS as the final state.
+     */
+    try {
+      await recordImageProcessingResult({
+        objectKey,
+        operation,
+        processingStatus: "FAILED",
+        message:
+          "The parking operation could not be completed. Please try again.",
+        httpStatus: 500,
+      });
+    } catch (statusError) {
+      console.error(
+        "Failed to store the image processing failure:",
+        statusError,
+      );
+    }
+
+    throw error;
+  }
 }
 
 export const handler = async (event) => {
