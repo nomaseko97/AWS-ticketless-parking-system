@@ -8,6 +8,7 @@ const sessionsEndpoint = `${apiBaseUrl}/sessions`;
 
 const MAX_FILE_SIZE = 5 * 1024 * 1024;
 const SESSION_REFRESH_INTERVAL = 10000;
+const PROCESSING_REFRESH_DELAY = 4000;
 
 function App() {
   const [operation, setOperation] = useState("entry");
@@ -20,6 +21,8 @@ function App() {
 
   const [sessions, setSessions] = useState([]);
   const [isLoadingSessions, setIsLoadingSessions] = useState(true);
+  const [isRefreshingSessions, setIsRefreshingSessions] =
+    useState(false);
   const [lastUpdated, setLastUpdated] = useState(null);
 
   const [sessionFilter, setSessionFilter] = useState("ALL");
@@ -31,6 +34,8 @@ function App() {
   const fetchSessions = useCallback(async (showLoading = false) => {
     if (showLoading) {
       setIsLoadingSessions(true);
+    } else {
+      setIsRefreshingSessions(true);
     }
 
     try {
@@ -43,18 +48,37 @@ function App() {
 
       if (!response.ok) {
         throw new Error(
-          `The parking sessions request returned status ${response.status}.`,
+          `Parking sessions request returned status ${response.status}.`,
         );
       }
 
       const data = await response.json();
 
-      setSessions(Array.isArray(data.sessions) ? data.sessions : []);
+      const receivedSessions = Array.isArray(data.sessions)
+        ? data.sessions
+        : [];
+
+      const newestSessionsFirst = [...receivedSessions].sort(
+        (firstSession, secondSession) => {
+          const firstTime = new Date(
+            firstSession.entry_timestamp,
+          ).getTime();
+
+          const secondTime = new Date(
+            secondSession.entry_timestamp,
+          ).getTime();
+
+          return secondTime - firstTime;
+        },
+      );
+
+      setSessions(newestSessionsFirst);
       setLastUpdated(new Date());
     } catch (error) {
       console.error("Failed to load parking sessions:", error);
     } finally {
       setIsLoadingSessions(false);
+      setIsRefreshingSessions(false);
     }
   }, []);
 
@@ -87,16 +111,16 @@ function App() {
   }, [selectedReceipt]);
 
   useEffect(() => {
-    function handleEscape(event) {
+    function handleEscapeKey(event) {
       if (event.key === "Escape") {
         setSelectedReceipt(null);
       }
     }
 
-    window.addEventListener("keydown", handleEscape);
+    window.addEventListener("keydown", handleEscapeKey);
 
     return () => {
-      window.removeEventListener("keydown", handleEscape);
+      window.removeEventListener("keydown", handleEscapeKey);
     };
   }, []);
 
@@ -120,6 +144,10 @@ function App() {
   }
 
   function handleOperationChange(nextOperation) {
+    if (isUploading) {
+      return;
+    }
+
     setOperation(nextOperation);
     resetImageForm();
   }
@@ -140,8 +168,14 @@ function App() {
       return "Please select a licence-plate image.";
     }
 
-    if (!file.type.startsWith("image/")) {
-      return "Please select a valid JPG or PNG image.";
+    const validImageTypes = [
+      "image/jpeg",
+      "image/jpg",
+      "image/png",
+    ];
+
+    if (!validImageTypes.includes(file.type)) {
+      return "Please select a JPG, JPEG or PNG image.";
     }
 
     if (file.size > MAX_FILE_SIZE) {
@@ -173,6 +207,66 @@ function App() {
     setPreviewUrl(URL.createObjectURL(file));
   }
 
+  async function readApiError(response, fallbackMessage) {
+    try {
+      const responseText = await response.text();
+
+      if (!responseText) {
+        return fallbackMessage;
+      }
+
+      try {
+        const parsedResponse = JSON.parse(responseText);
+
+        return (
+          parsedResponse.message ??
+          parsedResponse.error ??
+          fallbackMessage
+        );
+      } catch {
+        return responseText;
+      }
+    } catch {
+      return fallbackMessage;
+    }
+  }
+
+  function convertTechnicalErrorToUserMessage(message) {
+    const normalisedMessage = String(message ?? "").toLowerCase();
+
+    if (
+      normalisedMessage.includes("active parking session") ||
+      normalisedMessage.includes("already has an active")
+    ) {
+      return "This vehicle already has an active parking session.";
+    }
+
+    if (
+      normalisedMessage.includes("no active parking session") ||
+      normalisedMessage.includes("active session not found") ||
+      normalisedMessage.includes("matching parking session")
+    ) {
+      return "No active parking session was found for this vehicle.";
+    }
+
+    if (
+      normalisedMessage.includes("licence plate") ||
+      normalisedMessage.includes("license plate") ||
+      normalisedMessage.includes("plate could not")
+    ) {
+      return "The licence plate could not be read clearly. Please upload a clearer image.";
+    }
+
+    if (
+      normalisedMessage.includes("network") ||
+      normalisedMessage.includes("failed to fetch")
+    ) {
+      return "The service is temporarily unavailable. Please try again.";
+    }
+
+    return message || "The request could not be completed.";
+  }
+
   async function requestPresignedUploadUrl() {
     const response = await fetch(uploadUrlEndpoint, {
       method: "POST",
@@ -188,12 +282,20 @@ function App() {
     });
 
     if (!response.ok) {
-      throw new Error("The system could not prepare the image upload.");
+      const apiError = await readApiError(
+        response,
+        "The system could not prepare the image upload.",
+      );
+
+      throw new Error(convertTechnicalErrorToUserMessage(apiError));
     }
 
     const data = await response.json();
 
-    const uploadUrl = data.uploadUrl ?? data.presignedUrl ?? data.url;
+    const uploadUrl =
+      data.uploadUrl ??
+      data.presignedUrl ??
+      data.url;
 
     if (!uploadUrl) {
       throw new Error(
@@ -214,12 +316,18 @@ function App() {
     });
 
     if (!response.ok) {
-      throw new Error("The image could not be uploaded. Please try again.");
+      throw new Error(
+        "The image could not be uploaded. Please try again.",
+      );
     }
   }
 
   async function handleUpload(event) {
     event.preventDefault();
+
+    if (isUploading) {
+      return;
+    }
 
     setErrorMessage("");
     setSuccessMessage("");
@@ -242,20 +350,29 @@ function App() {
 
       setSuccessMessage(
         operation === "entry"
-          ? "Vehicle entry image uploaded successfully. The parking session is being created."
-          : "Vehicle exit image uploaded successfully. The parking session is being completed.",
+          ? "Image uploaded successfully. The vehicle entry is now being processed."
+          : "Image uploaded successfully. The vehicle exit is now being processed.",
       );
 
-      window.setTimeout(() => {
-        fetchSessions(false);
-      }, 4000);
+      window.setTimeout(async () => {
+        await fetchSessions(false);
+
+        setSuccessMessage(
+          operation === "entry"
+            ? "The vehicle entry has been processed. Check the parking sessions below."
+            : "The vehicle exit has been processed. The fee and receipt are now available below.",
+        );
+      }, PROCESSING_REFRESH_DELAY);
     } catch (error) {
       console.error("Image upload failed:", error);
 
-      setErrorMessage(
+      const rawMessage =
         error instanceof Error
           ? error.message
-          : "The image could not be uploaded. Please try again.",
+          : "The image could not be uploaded.";
+
+      setErrorMessage(
+        convertTechnicalErrorToUserMessage(rawMessage),
       );
     } finally {
       setIsUploading(false);
@@ -292,10 +409,13 @@ function App() {
     switch (status) {
       case "ACTIVE":
         return "status-badge status-active";
+
       case "COMPLETED":
         return "status-badge status-completed";
+
       case "FLAGGED":
         return "status-badge status-flagged";
+
       default:
         return "status-badge";
     }
@@ -305,10 +425,13 @@ function App() {
     switch (status) {
       case "ACTIVE":
         return "Active";
+
       case "COMPLETED":
         return "Completed";
+
       case "FLAGGED":
         return "Needs review";
+
       default:
         return status || "Unknown";
     }
@@ -318,16 +441,54 @@ function App() {
     switch (sessionFilter) {
       case "ACTIVE":
         return "Vehicles currently parked";
+
       case "COMPLETED":
         return "Completed parking sessions";
+
       case "FEES":
         return "Parking fees and receipts";
+
       default:
         return "All parking sessions";
     }
   }
 
+  function getEmptyStateTitle() {
+    switch (sessionFilter) {
+      case "ACTIVE":
+        return "No vehicles are currently parked";
+
+      case "COMPLETED":
+        return "No completed sessions yet";
+
+      case "FEES":
+        return "No parking receipts yet";
+
+      default:
+        return "No parking sessions yet";
+    }
+  }
+
+  function getEmptyStateDescription() {
+    switch (sessionFilter) {
+      case "ACTIVE":
+        return "Upload a vehicle entry image to start a parking session.";
+
+      case "COMPLETED":
+        return "Completed parking sessions will appear here after vehicle exits.";
+
+      case "FEES":
+        return "Parking fees and receipts will appear after completed vehicle exits.";
+
+      default:
+        return "Upload a vehicle entry image to start the first parking session.";
+    }
+  }
+
   function buildReceiptHtml(session) {
+    const receiptNumber =
+      session.receipt_number ?? "Parking receipt";
+
     return `
       <!DOCTYPE html>
       <html lang="en">
@@ -338,12 +499,16 @@ function App() {
             content="width=device-width, initial-scale=1.0"
           />
 
-          <title>${session.receipt_number}</title>
+          <title>${receiptNumber}</title>
 
           <style>
+            * {
+              box-sizing: border-box;
+            }
+
             body {
               margin: 0;
-              padding: 40px;
+              padding: 40px 20px;
               color: #10213f;
               background: #f4f7fb;
               font-family: Arial, sans-serif;
@@ -356,16 +521,22 @@ function App() {
               border: 1px solid #dfe7f2;
               border-radius: 18px;
               background: white;
+              box-shadow: 0 12px 30px rgba(23, 52, 97, 0.1);
             }
 
             .header {
               padding: 30px;
               color: white;
-              background: linear-gradient(120deg, #071b42, #1766d1);
+              background: linear-gradient(
+                120deg,
+                #071b42,
+                #1766d1
+              );
             }
 
             .header p {
               margin: 0 0 8px;
+              color: #bad0ff;
               font-size: 12px;
               font-weight: bold;
               letter-spacing: 2px;
@@ -374,6 +545,7 @@ function App() {
 
             .header h1 {
               margin: 0;
+              font-size: 30px;
             }
 
             .content {
@@ -400,6 +572,7 @@ function App() {
             .total {
               margin-top: 20px;
               padding: 20px;
+              border: 0;
               border-radius: 12px;
               background: #edf3ff;
             }
@@ -410,10 +583,11 @@ function App() {
             }
 
             .footer {
-              padding: 20px;
+              padding: 20px 30px;
               color: #6d7c90;
               background: #f7f9fc;
               text-align: center;
+              font-size: 13px;
             }
 
             @media print {
@@ -424,6 +598,7 @@ function App() {
 
               .receipt {
                 border: 0;
+                box-shadow: none;
               }
             }
           </style>
@@ -439,7 +614,7 @@ function App() {
             <section class="content">
               <div class="row">
                 <span class="label">Receipt number</span>
-                <span class="value">${session.receipt_number}</span>
+                <span class="value">${receiptNumber}</span>
               </div>
 
               <div class="row">
@@ -464,7 +639,7 @@ function App() {
               <div class="row">
                 <span class="label">Parking duration</span>
                 <span class="value">
-                  ${session.duration_minutes} minutes
+                  ${session.duration_minutes ?? 0} minutes
                 </span>
               </div>
 
@@ -476,7 +651,7 @@ function App() {
               </div>
 
               <div class="row">
-                <span class="label">Status</span>
+                <span class="label">Payment status</span>
                 <span class="value">Paid</span>
               </div>
 
@@ -503,22 +678,33 @@ function App() {
     });
 
     const receiptUrl = URL.createObjectURL(receiptBlob);
-    const link = document.createElement("a");
+    const downloadLink = document.createElement("a");
 
-    link.href = receiptUrl;
-    link.download = `${session.receipt_number}.html`;
+    downloadLink.href = receiptUrl;
+    downloadLink.download = `${
+      session.receipt_number ?? "parking-receipt"
+    }.html`;
 
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
+    document.body.appendChild(downloadLink);
+    downloadLink.click();
+    downloadLink.remove();
 
-    URL.revokeObjectURL(receiptUrl);
+    window.setTimeout(() => {
+      URL.revokeObjectURL(receiptUrl);
+    }, 100);
   }
 
   function printReceipt(session) {
-    const receiptWindow = window.open("", "_blank", "width=800,height=900");
+    const receiptWindow = window.open(
+      "",
+      "_blank",
+      "width=800,height=900",
+    );
 
     if (!receiptWindow) {
+      setErrorMessage(
+        "Please allow pop-ups to print or save the receipt as a PDF.",
+      );
       return;
     }
 
@@ -553,7 +739,10 @@ function App() {
         return session.session_status === "COMPLETED";
 
       case "FEES":
-        return session.session_status === "COMPLETED" && session.receipt_number;
+        return (
+          session.session_status === "COMPLETED" &&
+          Boolean(session.receipt_number)
+        );
 
       default:
         return true;
@@ -564,13 +753,15 @@ function App() {
     <div className="app-shell">
       <header className="topbar">
         <div>
-          <p className="eyebrow">NB Ticketless Parking System</p>
+          <p className="eyebrow">
+            NB Ticketless Parking System
+          </p>
 
           <h1>Vehicle Parking Dashboard</h1>
 
           <p className="header-description">
-            Upload vehicle licence plates and monitor parking sessions in real
-            time.
+            Upload vehicle licence plates and monitor parking sessions
+            in real time.
           </p>
         </div>
 
@@ -581,7 +772,10 @@ function App() {
       </header>
 
       <main className="dashboard">
-        <section className="summary-grid">
+        <section
+          className="summary-grid"
+          aria-label="Parking summary"
+        >
           <button
             type="button"
             className={
@@ -617,7 +811,9 @@ function App() {
                 ? "summary-card summary-card-button selected"
                 : "summary-card summary-card-button"
             }
-            onClick={() => handleSummaryCardClick("COMPLETED")}
+            onClick={() =>
+              handleSummaryCardClick("COMPLETED")
+            }
           >
             <span>Completed sessions</span>
             <strong>{completedSessions}</strong>
@@ -643,7 +839,10 @@ function App() {
           <article className="panel upload-panel">
             <div className="panel-heading">
               <div>
-                <p className="section-label">Vehicle check-in and exit</p>
+                <p className="section-label">
+                  Vehicle check-in and exit
+                </p>
+
                 <h2>Upload a licence-plate image</h2>
               </div>
             </div>
@@ -656,7 +855,10 @@ function App() {
                     ? "operation-button active"
                     : "operation-button"
                 }
-                onClick={() => handleOperationChange("entry")}
+                onClick={() =>
+                  handleOperationChange("entry")
+                }
+                disabled={isUploading}
               >
                 Vehicle entry
               </button>
@@ -668,14 +870,24 @@ function App() {
                     ? "operation-button active"
                     : "operation-button"
                 }
-                onClick={() => handleOperationChange("exit")}
+                onClick={() =>
+                  handleOperationChange("exit")
+                }
+                disabled={isUploading}
               >
                 Vehicle exit
               </button>
             </div>
 
             <form onSubmit={handleUpload}>
-              <label className="upload-area" htmlFor="vehicle-image">
+              <label
+                className={
+                  isUploading
+                    ? "upload-area upload-area-disabled"
+                    : "upload-area"
+                }
+                htmlFor="vehicle-image"
+              >
                 {previewUrl ? (
                   <img
                     src={previewUrl}
@@ -684,9 +896,23 @@ function App() {
                   />
                 ) : (
                   <div className="upload-placeholder">
-                    <span className="upload-icon">↑</span>
-                    <strong>Select a licence-plate image</strong>
-                    <small>JPG, JPEG or PNG — maximum size 5 MB</small>
+                    <span className="upload-icon">
+                      {isUploading ? (
+                        <span className="button-spinner" />
+                      ) : (
+                        "↑"
+                      )}
+                    </span>
+
+                    <strong>
+                      {isUploading
+                        ? "Uploading and processing image"
+                        : "Select a licence-plate image"}
+                    </strong>
+
+                    <small>
+                      JPG, JPEG or PNG — maximum size 5 MB
+                    </small>
                   </div>
                 )}
 
@@ -696,6 +922,7 @@ function App() {
                   type="file"
                   accept="image/png,image/jpeg,image/jpg"
                   onChange={handleImageSelection}
+                  disabled={isUploading}
                   hidden
                 />
               </label>
@@ -704,13 +931,17 @@ function App() {
                 <div className="selected-file-row">
                   <div>
                     <strong>{selectedImage.name}</strong>
-                    <small>{(selectedImage.size / 1024).toFixed(1)} KB</small>
+
+                    <small>
+                      {(selectedImage.size / 1024).toFixed(1)} KB
+                    </small>
                   </div>
 
                   <button
                     type="button"
                     className="text-button"
                     onClick={resetImageForm}
+                    disabled={isUploading}
                   >
                     Remove
                   </button>
@@ -718,11 +949,21 @@ function App() {
               )}
 
               {errorMessage && (
-                <div className="message error-message">{errorMessage}</div>
+                <div
+                  className="message error-message"
+                  role="alert"
+                >
+                  {errorMessage}
+                </div>
               )}
 
               {successMessage && (
-                <div className="message success-message">{successMessage}</div>
+                <div
+                  className="message success-message"
+                  role="status"
+                >
+                  {successMessage}
+                </div>
               )}
 
               <button
@@ -730,8 +971,12 @@ function App() {
                 className="primary-button"
                 disabled={!selectedImage || isUploading}
               >
+                {isUploading && (
+                  <span className="button-spinner" />
+                )}
+
                 {isUploading
-                  ? "Uploading image..."
+                  ? "Processing image..."
                   : operation === "entry"
                     ? "Start parking session"
                     : "Complete parking session"}
@@ -751,39 +996,53 @@ function App() {
             <div className="process-list">
               <div className="process-item">
                 <span>1</span>
-                <p>Upload a clear photo of the vehicle&apos;s licence plate.</p>
+
+                <p>
+                  Upload a clear photo of the vehicle&apos;s licence
+                  plate.
+                </p>
               </div>
 
               <div className="process-item">
                 <span>2</span>
+
                 <p>
                   {operation === "entry"
                     ? "The system reads the licence plate automatically."
-                    : "The system reads the licence plate and finds the matching parking session."}
+                    : "The system reads the plate and finds the matching parking session."}
                 </p>
               </div>
 
               <div className="process-item">
                 <span>3</span>
+
                 <p>
                   {operation === "entry"
                     ? "A parking session is started and the vehicle is recorded."
-                    : "The parking fee is calculated and the session is completed."}
+                    : "The parking fee is calculated and a receipt is created."}
                 </p>
               </div>
             </div>
           </article>
         </section>
 
-        <section ref={sessionsSectionRef} className="panel sessions-panel">
+        <section
+          ref={sessionsSectionRef}
+          className="panel sessions-panel"
+        >
           <div className="panel-heading sessions-heading">
             <div>
-              <p className="section-label">Vehicle activity</p>
+              <p className="section-label">
+                Vehicle activity
+              </p>
+
               <h2>{getSessionsHeading()}</h2>
 
               <p className="last-updated">
                 {lastUpdated
-                  ? `Last updated at ${lastUpdated.toLocaleTimeString("en-ZA")}`
+                  ? `Last updated at ${lastUpdated.toLocaleTimeString(
+                      "en-ZA",
+                    )}`
                   : "Waiting for parking session information"}
               </p>
             </div>
@@ -792,20 +1051,38 @@ function App() {
               type="button"
               className="refresh-button"
               onClick={() => fetchSessions(true)}
-              disabled={isLoadingSessions}
+              disabled={
+                isLoadingSessions || isRefreshingSessions
+              }
             >
-              {isLoadingSessions ? "Refreshing..." : "Refresh sessions"}
+              {(isLoadingSessions ||
+                isRefreshingSessions) && (
+                <span className="small-spinner" />
+              )}
+
+              {isLoadingSessions || isRefreshingSessions
+                ? "Refreshing..."
+                : "Refresh sessions"}
             </button>
           </div>
 
+          {isRefreshingSessions &&
+            sessions.length > 0 && (
+              <div className="refresh-notice">
+                Updating parking information…
+              </div>
+            )}
+
           {isLoadingSessions && sessions.length === 0 ? (
             <div className="empty-state">
-              <p>Loading parking sessions...</p>
+              <span className="large-spinner" />
+              <h3>Loading parking sessions</h3>
+              <p>Please wait while the latest information loads.</p>
             </div>
           ) : filteredSessions.length === 0 ? (
             <div className="empty-state">
-              <h3>No matching parking sessions</h3>
-              <p>No information is currently available for this category.</p>
+              <h3>{getEmptyStateTitle()}</h3>
+              <p>{getEmptyStateDescription()}</p>
             </div>
           ) : (
             <div className="table-container">
@@ -824,39 +1101,68 @@ function App() {
 
                 <tbody>
                   {filteredSessions.map((session) => (
-                    <tr key={session.session_id}>
+                    <tr
+                      key={session.session_id}
+                      className={
+                        session.session_status === "ACTIVE"
+                          ? "active-session-row"
+                          : ""
+                      }
+                    >
                       <td>
                         <strong className="plate-number">
                           {session.license_plate}
                         </strong>
+
+                        {session.review_required && (
+                          <small className="review-text">
+                            Plate needs review
+                          </small>
+                        )}
                       </td>
 
                       <td>
                         <span
-                          className={getStatusClass(session.session_status)}
+                          className={getStatusClass(
+                            session.session_status,
+                          )}
                         >
-                          {getStatusLabel(session.session_status)}
+                          <span className="status-dot" />
+
+                          {getStatusLabel(
+                            session.session_status,
+                          )}
                         </span>
                       </td>
 
-                      <td>{formatDateTime(session.entry_timestamp)}</td>
+                      <td>
+                        {formatDateTime(
+                          session.entry_timestamp,
+                        )}
+                      </td>
 
                       <td>
                         {session.exit_timestamp
-                          ? formatDateTime(session.exit_timestamp)
+                          ? formatDateTime(
+                              session.exit_timestamp,
+                            )
                           : "Not exited"}
                       </td>
 
                       <td>
-                        {session.duration_minutes
+                        {session.duration_minutes != null
                           ? `${session.duration_minutes} minutes`
-                          : "Still parked"}
+                          : session.session_status === "ACTIVE"
+                            ? "Still parked"
+                            : "Not available"}
                       </td>
 
                       <td>
                         {session.session_status === "ACTIVE"
-                          ? "Calculating..."
-                          : formatCurrency(session.calculated_fee)}
+                          ? "Calculating…"
+                          : formatCurrency(
+                              session.calculated_fee,
+                            )}
                       </td>
 
                       <td>
@@ -864,12 +1170,16 @@ function App() {
                           <button
                             type="button"
                             className="receipt-link-button"
-                            onClick={() => setSelectedReceipt(session)}
+                            onClick={() =>
+                              setSelectedReceipt(session)
+                            }
                           >
                             Open receipt
                           </button>
                         ) : (
-                          "Available after exit"
+                          <span className="receipt-unavailable">
+                            Available after exit
+                          </span>
                         )}
                       </td>
                     </tr>
@@ -900,7 +1210,10 @@ function App() {
             <header className="receipt-modal-header">
               <div>
                 <p>NB Ticketless Parking System</p>
-                <h2 id="receipt-title">Parking Receipt</h2>
+
+                <h2 id="receipt-title">
+                  Parking Receipt
+                </h2>
               </div>
 
               <button
@@ -914,49 +1227,77 @@ function App() {
             </header>
 
             <div className="receipt-body">
+              <div className="receipt-paid-badge">
+                Payment completed
+              </div>
+
               <div className="receipt-row">
                 <span>Receipt number</span>
-                <strong>{selectedReceipt.receipt_number}</strong>
+
+                <strong>
+                  {selectedReceipt.receipt_number}
+                </strong>
               </div>
 
               <div className="receipt-row">
                 <span>Licence plate</span>
-                <strong>{selectedReceipt.license_plate}</strong>
+
+                <strong>
+                  {selectedReceipt.license_plate}
+                </strong>
               </div>
 
               <div className="receipt-row">
                 <span>Entry date and time</span>
+
                 <strong>
-                  {formatDateTime(selectedReceipt.entry_timestamp)}
+                  {formatDateTime(
+                    selectedReceipt.entry_timestamp,
+                  )}
                 </strong>
               </div>
 
               <div className="receipt-row">
                 <span>Exit date and time</span>
+
                 <strong>
-                  {formatDateTime(selectedReceipt.exit_timestamp)}
+                  {formatDateTime(
+                    selectedReceipt.exit_timestamp,
+                  )}
                 </strong>
               </div>
 
               <div className="receipt-row">
                 <span>Parking duration</span>
-                <strong>{selectedReceipt.duration_minutes} minutes</strong>
+
+                <strong>
+                  {selectedReceipt.duration_minutes ?? 0} minutes
+                </strong>
               </div>
 
               <div className="receipt-row">
                 <span>Hourly rate</span>
-                <strong>{formatCurrency(selectedReceipt.hourly_rate)}</strong>
+
+                <strong>
+                  {formatCurrency(
+                    selectedReceipt.hourly_rate,
+                  )}
+                </strong>
               </div>
 
               <div className="receipt-row">
-                <span>Status</span>
+                <span>Payment status</span>
+
                 <strong>Paid</strong>
               </div>
 
               <div className="receipt-total">
                 <span>Total parking fee</span>
+
                 <strong>
-                  {formatCurrency(selectedReceipt.calculated_fee)}
+                  {formatCurrency(
+                    selectedReceipt.calculated_fee,
+                  )}
                 </strong>
               </div>
             </div>
@@ -973,7 +1314,9 @@ function App() {
               <button
                 type="button"
                 className="secondary-button"
-                onClick={() => printReceipt(selectedReceipt)}
+                onClick={() =>
+                  printReceipt(selectedReceipt)
+                }
               >
                 Print or save as PDF
               </button>
@@ -981,7 +1324,9 @@ function App() {
               <button
                 type="button"
                 className="primary-action-button"
-                onClick={() => downloadReceipt(selectedReceipt)}
+                onClick={() =>
+                  downloadReceipt(selectedReceipt)
+                }
               >
                 Download receipt
               </button>

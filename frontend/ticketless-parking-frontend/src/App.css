@@ -1,12 +1,7 @@
 :root {
   font-family:
-    Inter,
-    ui-sans-serif,
-    system-ui,
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;
   color: #10213f;
   background: #f4f7fb;
   font-synthesis: none;
@@ -39,6 +34,13 @@ button {
   cursor: pointer;
 }
 
+button:focus-visible,
+input:focus-visible,
+.upload-area:focus-within {
+  outline: 3px solid rgba(47, 102, 255, 0.25);
+  outline-offset: 3px;
+}
+
 .app-shell {
   min-height: 100vh;
 }
@@ -50,7 +52,13 @@ button {
   align-items: flex-start;
   padding: 2.5rem clamp(1.25rem, 4vw, 4rem);
   color: white;
-  background: linear-gradient(120deg, #071b42 0%, #123f91 55%, #1766d1 100%);
+  background:
+    linear-gradient(
+      120deg,
+      #071b42 0%,
+      #123f91 55%,
+      #1766d1 100%
+    );
   box-shadow: 0 12px 35px rgba(4, 22, 54, 0.2);
 }
 
@@ -162,11 +170,6 @@ button {
   box-shadow: 0 16px 35px rgba(23, 52, 97, 0.14);
 }
 
-.summary-card-button:focus-visible {
-  outline: 3px solid rgba(47, 102, 255, 0.25);
-  outline-offset: 3px;
-}
-
 .summary-card-button.selected {
   border-color: #2f66ff;
   background: #f7f9ff;
@@ -186,6 +189,7 @@ button {
     minmax(0, 1.45fr)
     minmax(300px, 0.8fr);
   gap: 1.25rem;
+  align-items: start;
   margin-bottom: 1.25rem;
 }
 
@@ -227,10 +231,20 @@ button {
   font-weight: 750;
 }
 
+.operation-button:hover:not(:disabled) {
+  color: #1559c6;
+  background: rgba(255, 255, 255, 0.7);
+}
+
 .operation-button.active {
   color: white;
   background: #1559c6;
   box-shadow: 0 8px 18px rgba(21, 89, 198, 0.24);
+}
+
+.operation-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
 }
 
 .upload-area {
@@ -240,6 +254,7 @@ button {
   border: 2px dashed #b9c8de;
   border-radius: 18px;
   background: #f8faff;
+  cursor: pointer;
   transition:
     border-color 150ms ease,
     background 150ms ease,
@@ -250,6 +265,15 @@ button {
   border-color: #2f66ff;
   background: #f1f6ff;
   transform: translateY(-1px);
+}
+
+.upload-area-disabled {
+  cursor: wait;
+  opacity: 0.8;
+}
+
+.upload-area-disabled:hover {
+  transform: none;
 }
 
 .upload-placeholder {
@@ -304,6 +328,11 @@ button {
 .selected-file-row div {
   display: grid;
   gap: 0.2rem;
+  min-width: 0;
+}
+
+.selected-file-row strong {
+  overflow-wrap: anywhere;
 }
 
 .selected-file-row small {
@@ -313,6 +342,10 @@ button {
 .text-button,
 .refresh-button,
 .secondary-button {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  gap: 0.5rem;
   border: 1px solid #cbd7e7;
   border-radius: 10px;
   color: #1559c6;
@@ -330,19 +363,25 @@ button {
 }
 
 .refresh-button:hover:not(:disabled),
-.text-button:hover,
+.text-button:hover:not(:disabled),
 .secondary-button:hover {
   border-color: #2f66ff;
   background: #f4f7ff;
 }
 
-.refresh-button:disabled {
+.refresh-button:disabled,
+.text-button:disabled {
   cursor: not-allowed;
   opacity: 0.6;
 }
 
 .primary-button {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 0.65rem;
   width: 100%;
+  min-height: 48px;
   margin-top: 1rem;
   border: 0;
   border-radius: 12px;
@@ -384,7 +423,14 @@ button {
 }
 
 .information-panel {
-  background: linear-gradient(145deg, #0d2a61 0%, #174da4 100%);
+  align-self: start;
+  min-height: auto;
+  background:
+    linear-gradient(
+      145deg,
+      #0d2a61 0%,
+      #174da4 100%
+    );
   color: white;
 }
 
@@ -432,6 +478,16 @@ button {
   font-size: 0.85rem;
 }
 
+.refresh-notice {
+  margin-top: 1rem;
+  padding: 0.7rem 0.9rem;
+  border-radius: 10px;
+  color: #1559c6;
+  background: #edf3ff;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
 .sessions-panel {
   overflow: hidden;
   scroll-margin-top: 1.5rem;
@@ -446,7 +502,7 @@ button {
 
 .sessions-table {
   width: 100%;
-  min-width: 1100px;
+  min-width: 1120px;
   border-collapse: collapse;
 }
 
@@ -467,6 +523,10 @@ button {
   text-transform: uppercase;
 }
 
+.sessions-table tbody tr {
+  transition: background 150ms ease;
+}
+
 .sessions-table tbody tr:hover {
   background: #f9fbfe;
 }
@@ -475,33 +535,60 @@ button {
   border-bottom: 0;
 }
 
+.active-session-row {
+  background: rgba(221, 248, 234, 0.28);
+}
+
+.active-session-row:hover {
+  background: rgba(221, 248, 234, 0.5) !important;
+}
+
 .plate-number {
   display: block;
   color: #0f2447;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family:
+    ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9rem;
   letter-spacing: 0.05em;
+}
+
+.review-text {
+  display: block;
+  margin-top: 0.3rem;
+  color: #a85a00;
+  font-size: 0.75rem;
 }
 
 .status-badge {
   display: inline-flex;
   align-items: center;
+  gap: 0.4rem;
   border-radius: 999px;
-  padding: 0.36rem 0.65rem;
+  padding: 0.4rem 0.68rem;
   color: #56657b;
   background: #edf1f6;
   font-size: 0.72rem;
   font-weight: 850;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.04em;
+}
+
+.status-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: currentColor;
 }
 
 .status-active {
-  color: #0a6d43;
-  background: #ddf8ea;
+  color: #087143;
+  background: #d9f8e8;
+  box-shadow: inset 0 0 0 1px rgba(8, 113, 67, 0.12);
 }
 
 .status-completed {
-  color: #154f9e;
-  background: #e2edff;
+  color: #184d97;
+  background: #e3edff;
+  box-shadow: inset 0 0 0 1px rgba(24, 77, 151, 0.1);
 }
 
 .status-flagged {
@@ -509,7 +596,15 @@ button {
   background: #fff0d8;
 }
 
+.receipt-unavailable {
+  color: #7a899d;
+  font-size: 0.82rem;
+}
+
 .empty-state {
+  display: grid;
+  justify-items: center;
+  gap: 0.5rem;
   margin-top: 1.25rem;
   padding: 3rem 1rem;
   border: 1px dashed #cbd6e5;
@@ -524,7 +619,6 @@ button {
 }
 
 .empty-state p {
-  margin-top: 0.45rem;
   color: #718097;
 }
 
@@ -542,6 +636,42 @@ button {
   background: #0e4faf;
 }
 
+.button-spinner,
+.small-spinner,
+.large-spinner {
+  display: inline-block;
+  border-radius: 50%;
+  animation: spin 750ms linear infinite;
+}
+
+.button-spinner {
+  width: 1rem;
+  height: 1rem;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: white;
+}
+
+.small-spinner {
+  width: 0.9rem;
+  height: 0.9rem;
+  border: 2px solid rgba(21, 89, 198, 0.25);
+  border-top-color: #1559c6;
+}
+
+.large-spinner {
+  width: 2.25rem;
+  height: 2.25rem;
+  margin-bottom: 0.3rem;
+  border: 3px solid rgba(21, 89, 198, 0.2);
+  border-top-color: #1559c6;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .modal-backdrop {
   position: fixed;
   z-index: 1000;
@@ -549,7 +679,7 @@ button {
   display: grid;
   place-items: center;
   padding: 1rem;
-  background: rgba(5, 18, 42, 0.7);
+  background: rgba(5, 18, 42, 0.72);
   backdrop-filter: blur(5px);
 }
 
@@ -557,6 +687,7 @@ button {
   width: min(100%, 720px);
   max-height: calc(100vh - 2rem);
   overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 22px;
   background: white;
   box-shadow: 0 30px 80px rgba(3, 15, 36, 0.4);
@@ -568,7 +699,12 @@ button {
   gap: 2rem;
   padding: 1.7rem;
   color: white;
-  background: linear-gradient(120deg, #071b42 0%, #1766d1 100%);
+  background:
+    linear-gradient(
+      120deg,
+      #071b42 0%,
+      #1766d1 100%
+    );
 }
 
 .receipt-modal-header p {
@@ -591,11 +727,13 @@ button {
   place-items: center;
   width: 2.5rem;
   height: 2.5rem;
+  flex-shrink: 0;
   border: 0;
   border-radius: 50%;
   color: white;
   background: rgba(255, 255, 255, 0.15);
   font-size: 1.8rem;
+  line-height: 1;
 }
 
 .receipt-close-button:hover {
@@ -606,6 +744,17 @@ button {
   max-height: calc(100vh - 280px);
   overflow-y: auto;
   padding: 1.7rem;
+}
+
+.receipt-paid-badge {
+  width: fit-content;
+  margin-bottom: 0.75rem;
+  border-radius: 999px;
+  padding: 0.45rem 0.75rem;
+  color: #087143;
+  background: #d9f8e8;
+  font-size: 0.8rem;
+  font-weight: 800;
 }
 
 .receipt-row {
@@ -623,6 +772,7 @@ button {
 
 .receipt-row strong {
   text-align: right;
+  overflow-wrap: anywhere;
 }
 
 .receipt-total {
@@ -709,6 +859,18 @@ button {
     width: 100%;
   }
 
+  .receipt-modal-header {
+    padding: 1.25rem;
+  }
+
+  .receipt-modal-header h2 {
+    font-size: 1.45rem;
+  }
+
+  .receipt-body {
+    padding: 1.25rem;
+  }
+
   .receipt-row,
   .receipt-total {
     flex-direction: column;
@@ -722,6 +884,7 @@ button {
 
   .receipt-actions {
     flex-direction: column;
+    padding: 1rem 1.25rem;
   }
 
   .receipt-actions button {
