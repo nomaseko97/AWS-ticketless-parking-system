@@ -57,7 +57,7 @@ This project demonstrates a complete cloud workflow from frontend upload to serv
 # Architecture Diagram
 
 <p align="center">
-  <img src="docs/aws-ticketless-parking-architecture.png"
+  <img src="./Project%20Screenshot/AWS-Ticketless-Parking-Architecture-AWS-Icons_0531.jpg"
        alt="AWS Ticketless Parking System Architecture"
        width="900">
 </p>
