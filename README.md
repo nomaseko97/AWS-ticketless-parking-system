@@ -207,7 +207,7 @@ AWS-ticketless-parking-system/
 
 ## Application Dashboard
 
-<img src="./Project%20Screenshot/session.png" width="700">
+<img src="./Project%20Screenshot/Dashboardpng.png" width="700">
 
 ## Vehicle Entry
 
@@ -222,7 +222,7 @@ AWS-ticketless-parking-system/
 
 ## Active Parking Session
 
-<img src="./Project%20Screenshot/platesaved.png" width="700">
+<img src="./Project%20Screenshot/parkingSessions.png" width="700">
 
 ## Duplicate Entry Prevention
 
@@ -230,15 +230,19 @@ AWS-ticketless-parking-system/
 
 ## Vehicle Exit
 
-<img src="./Project%20Screenshot/ Vehicle Exit.png" width="700">
+<img src="./Project%20Screenshot/vehicleExit.png" width="700">
+
+## Vehicle Exited
+
+<img src="./Project%20Screenshot/vehicleExited.png" width="700">
 
 ## Completed Parking Session
 
-<img src="./Project%20Screenshot/7 Completed Parking Session.png" width="700">
+<img src="./Project%20Screenshot/completedSession.png" width="700">
 
 ## Generated Receipt
 
-<img src="./Project%20Screenshot/ Generated Receipt.png" width="700">
+<img src="./Project%20Screenshot/receipt.png" width="700">
 
 ## Amazon S3 Image Upload
 
