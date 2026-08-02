@@ -244,17 +244,20 @@ AWS-ticketless-parking-system/
 
 <img src="./Project%20Screenshot/receipt.png" width="700">
 
-## Amazon S3 Image Upload
+## Amazon S3 Image Upload-Entry
 
-<img src="./Project%20Screenshot/ Amazon S3 Image Upload.png" width="700">
+<img src="./Project%20Screenshot/s3UploadEntry.png" width="700">
 
+## Amazon S3 Image Upload-Exit
+
+<img src="./Project%20Screenshot/s3UploadExit.png" width="700">
 ## AWS Lambda Functions
 
-<img src=./Project%20Screenshot/10 AWS Lambda Functions.png" width="700">
+<img src="./Project%20Screenshot/lambdaFunctions.png" width="700">
 
 ## Amazon API Gateway Routes
 
-<img src="./Project%20Screenshot/ API Gateway Routes.png" width="700">
+<img src="./Project%20Screenshot/apiGateway.png" width="700">
 
 ## Amazon RDS Parking Session
 
@@ -262,7 +265,7 @@ AWS-ticketless-parking-system/
 
 ## CloudWatch Processing Logs
 
-<img src="./Project%20Screenshot/3 CloudWatch Processing Logs.png" width="700">
+<img src="./Project%20Screenshot/cloudWatch.png" width="700">
 
 
 
