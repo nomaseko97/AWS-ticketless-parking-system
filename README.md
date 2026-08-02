@@ -216,6 +216,7 @@ AWS-ticketless-parking-system/
 ## Vehicle Entered
 
 <img src="./Project%20Screenshot/vehicle%20entered.png" width="700">
+
 ## Image Preview
 
 <img src="./Project%20Screenshot/vehicleEntry.png" width="700">
@@ -226,7 +227,7 @@ AWS-ticketless-parking-system/
 
 ## Duplicate Entry Prevention
 
-<img src="./Project%20Screenshot/duplicateParking.png" width="700">
+<img src="./Project%20Screenshot/duplicateEntry.png" width="700">
 
 ## Vehicle Exit
 
