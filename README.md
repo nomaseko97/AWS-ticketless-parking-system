@@ -207,59 +207,57 @@ AWS-ticketless-parking-system/
 
 ## Application Dashboard
 
-<img src="Screenshots/1 Dashboard.png" width="700">
+<img src="./Project%20Screenshot/1" width="700">
 
 ## Vehicle Entry
 
-<img src="Screenshots/2 Vehicle Entry.png" width="700">
+<img src="AWS-Ticketless-Parking-Architecture-AWS-Icons_0531.jpg" width="700">
 
 ## Image Preview
 
-<img src="Screenshots/3 Image Preview.png" width="700">
+<img src="Project%20Screenshot/imageReview.PNG" width="700">
 
 ## Active Parking Session
 
-<img src="Screenshots/4 Active Parking Session.png" width="700">
+<img src="./Project%20Screenshot/platesaved.png" width="700">
 
 ## Duplicate Entry Prevention
 
-<img src="Screenshots/5 Duplicate Entry Prevention.png" width="700">
+<img src="./Project%20Screenshot/5 Duplicate Entry Prevention.png" width="700">
 
 ## Vehicle Exit
 
-<img src="Screenshots/6 Vehicle Exit.png" width="700">
+<img src="./Project%20Screenshot/ Vehicle Exit.png" width="700">
 
 ## Completed Parking Session
 
-<img src="Screenshots/7 Completed Parking Session.png" width="700">
+<img src="./Project%20Screenshot/7 Completed Parking Session.png" width="700">
 
 ## Generated Receipt
 
-<img src="Screenshots/8 Generated Receipt.png" width="700">
+<img src="./Project%20Screenshot/ Generated Receipt.png" width="700">
 
 ## Amazon S3 Image Upload
 
-<img src="Screenshots/9 Amazon S3 Image Upload.png" width="700">
+<img src="./Project%20Screenshot/ Amazon S3 Image Upload.png" width="700">
 
 ## AWS Lambda Functions
 
-<img src="Screenshots/10 AWS Lambda Functions.png" width="700">
+<img src=./Project%20Screenshot/10 AWS Lambda Functions.png" width="700">
 
 ## Amazon API Gateway Routes
 
-<img src="Screenshots/11 API Gateway Routes.png" width="700">
+<img src="./Project%20Screenshot/ API Gateway Routes.png" width="700">
 
 ## Amazon RDS Parking Session
 
-<img src="Screenshots/12 RDS Parking Session.png" width="700">
+<img src="./Project%20Screenshot/ RDS Parking Session.png" width="700">
 
 ## CloudWatch Processing Logs
 
-<img src="Screenshots/13 CloudWatch Processing Logs.png" width="700">
+<img src="./Project%20Screenshot/3 CloudWatch Processing Logs.png" width="700">
 
-## Architecture Diagram
 
-<img src="docs/aws-ticketless-parking-architecture.png" width="900">
 
 ---
 
