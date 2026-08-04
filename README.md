@@ -260,10 +260,6 @@ AWS-ticketless-parking-system/
 
 <img src="./Project%20Screenshot/apiGateway.png" width="700">
 
-## Amazon RDS Parking Session
-
-<img src="./Project%20Screenshot/ RDS Parking Session.png" width="700">
-
 ## CloudWatch Processing Logs
 
 <img src="./Project%20Screenshot/cloudWatch.png" width="700">
